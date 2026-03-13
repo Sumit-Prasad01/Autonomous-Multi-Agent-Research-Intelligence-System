@@ -1,13 +1,25 @@
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-class Settings:
-
-    GROQ_API_KEY = os.getenv("GROQ_PAI_KEY")
-    HF_TOKEN = os.getenv("HF_TOKEN")
-    HUGGINFACEHUB_API_TOKEN = os.getenv("HUGGINFACEHUB_API_TOKEN")
+from src.research_intelligence_system.constants import CONFIG_FILE_PATH, PARAMS_FILE_PATH
+from src.research_intelligence_system.utils.common import read_yaml, create_directories
+from src.research_intelligence_system.entity import DataIngestionConfig
 
 
-settings = Settings()
+class ConfigurationManager:
+
+    def __init__(self, config_file_path = CONFIG_FILE_PATH, params_file_path = PARAMS_FILE_PATH):
+        self.config = read_yaml(config_file_path)
+        self.params = read_yaml(params_file_path)
+
+        create_directories([self.config.artifacts_root])
+
+    
+    def get_data_ingestion_config(self) -> DataIngestionConfig:
+        config = self.config.data_ingestion
+        create_directories([config.root_dir])
+
+        data_ingestion_config = DataIngestionConfig(
+            root_dir = config.root_dir,
+            dataset_name = config.dataset_name,
+            unzip_dir = config.unzip_dir
+        )
+
+        return data_ingestion_config

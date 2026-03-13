@@ -1,6 +1,6 @@
 from langchain_groq import ChatGroq
 
-from src.research_intelligence_system.config.configuration import settings
+from src.research_intelligence_system.config.config import settings
 from src.research_intelligence_system.utils.logger import get_logger
 from src.research_intelligence_system.utils.custom_exception import CustomException
 from src.research_intelligence_system.constants import MODEL
