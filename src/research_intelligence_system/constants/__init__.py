@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-PDF_PATH = "data/"
+PDF_PATH = "artifacts/data/"
 HF_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 DB_FAISS_PATH = "vectorstore/db_faiss"
 # DATA_PATH = f'data/{file_name}.pdf'

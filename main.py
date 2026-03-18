@@ -1,20 +1,28 @@
-from src.research_intelligence_system.utils.logger import get_logger
-from src.research_intelligence_system.utils.custom_exception import CustomException
-from src.research_intelligence_system.pipeline.summarization_model_finetuning_pipeline.stage1_data_ingestion_pipeline import DataIngestionTrainingPipeline
+from fastapi import FastAPI
+import uvicorn
 
-logger = get_logger(__name__)
+from api.chat import router
 
-STAGE_NAME = "Data Ingestion Stage"
 
-try:
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="Research Intelligence API",
+        description="RAG-based QA system with optional web search using Groq and FAISS",
+        version="1.0.0"
+    )
 
-    logger.info(f"Stage {STAGE_NAME} initiated.")
+    app.include_router(router, prefix="/api")
 
-    data_ingestion_pipeline = DataIngestionTrainingPipeline()
-    data_ingestion_pipeline.initiate_data_ingestion()
+    return app
 
-    logger.info(f"Stage {STAGE_NAME} completed.")
 
-except Exception as e:
-    logger.exception(e)
-    raise CustomException("Failed to download data.", e)
+app = create_app()
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host="127.0.0.1",   
+        port=8000,
+        reload=False
+    )

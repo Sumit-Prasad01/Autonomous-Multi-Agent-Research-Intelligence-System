@@ -1,10 +1,16 @@
-from langchain_classic.chains import RetrievalQA
-from langchain_classic.prompts import PromptTemplate
+# src/research_intelligence_system/rag/retriever.py
 
-from src.research_intelligence_system.agents.llm import load_llm
+from functools import lru_cache
+
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableLambda
+
+from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors.chain_extract import LLMChainExtractor
+
+from src.research_intelligence_system.rag.llm import load_llm
 from src.research_intelligence_system.rag.vector_store import load_vector_store
-from src.research_intelligence_system.config.config import settings
-from src.research_intelligence_system.constants import MODEL
+from src.research_intelligence_system.config.settings import settings
 from src.research_intelligence_system.utils.logger import get_logger
 from src.research_intelligence_system.utils.custom_exception import CustomException
 
@@ -12,66 +18,77 @@ logger = get_logger(__name__)
 
 
 CUSTOM_PROMPT_TEMPLATE = """
-You are an AI research assistant.
+You are a research assistant.
 
-Answer the question using ONLY the information provided in the context from research papers.
+Answer ONLY from the given context.
+If not found, say: "Answer not found in provided research papers."
 
-If the context does not contain the answer, say:
-"I could not find the answer in the provided research papers."
-
-Provide the answer in 3-5 concise sentences.
+Answer in {max_sentences} concise sentences.
 
 Context:
 {context}
 
 Question:
-{question}
-
-Answer:
+{input}
 """
 
 
-def set_custom_prompt():
-    return PromptTemplate(
-        template=CUSTOM_PROMPT_TEMPLATE,
-        input_variables = ["context", "question"]
-    )
+def get_prompt():
+    return PromptTemplate.from_template(CUSTOM_PROMPT_TEMPLATE)
 
 
-def create_qa_chain():
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+
+@lru_cache(maxsize=5)
+def create_qa_chain(llm_id: str):
+    """
+    Build LCEL RAG pipeline:
+    - MMR retrieval
+    - Context compression
+    - Prompt → LLM
+    """
+
     try:
-
-        logger.info("Loading vector store for context retrieval.")
+        logger.info(f"Creating RAG chain for model: {llm_id}")
 
         db = load_vector_store()
+        llm = load_llm(llm_id)
 
-        if db is None:
-            raise CustomException("Vector store not present or empty.")
-
-        logger.info("Loading LLM.")
-
-        llm = load_llm(
-            groq_api_key = settings.GROQ_API_KEY,
-            model = MODEL
+        base_retriever = db.as_retriever(
+            search_type="mmr",
+            search_kwargs={
+                "k": settings.RETRIEVAL_K,
+                "lambda_mult": settings.RETRIEVAL_LAMBDA
+            }
         )
 
-        if llm is None:
-            raise CustomException("Failed to load LLM.")
+        compressor = LLMChainExtractor.from_llm(llm)
 
-        logger.info("Creating RetrievalQA chain.")
-
-        qa_chain = RetrievalQA.from_chain_type(
-            llm = llm,
-            chain_type = "stuff",
-            retriever = db.as_retriever(search_kwargs={"k": 3}),
-            return_source_documents = True,
-            chain_type_kwargs = {"prompt": set_custom_prompt()}
+        retriever = ContextualCompressionRetriever(
+            base_retriever=base_retriever,
+            base_compressor=compressor
         )
 
-        logger.info("QA chain created successfully.")
+        prompt = get_prompt()
 
-        return qa_chain
+        rag_chain = (
+            {
+                "context": RunnableLambda(lambda x: x["input"]) 
+                        | retriever 
+                        | RunnableLambda(format_docs),
+
+                "input": RunnableLambda(lambda x: x["input"]),
+
+                "max_sentences": RunnableLambda(lambda _: settings.MAX_ANSWER_SENTENCES)
+            }
+            | prompt
+            | llm
+        )
+
+        return rag_chain
 
     except Exception as e:
-        logger.exception("Failed to create QA chain.")
-        raise CustomException("QA chain creation failed.", e)
+        logger.exception("Failed to create RAG chain.")
+        raise CustomException("RAG pipeline creation failed.", e)
