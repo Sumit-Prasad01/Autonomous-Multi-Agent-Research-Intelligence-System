@@ -109,3 +109,19 @@ Store conversations
 
 Enables real multi-session usage
 ```
+
+```
+Load Data
+   ↓
+Clean Text
+   ↓
+Validate Dataset  
+   ↓
+Filter Bad Samples
+   ↓
+Log Metrics       
+   ↓
+Tokenize (HF Overflow)
+   ↓
+Save Dataset
+```

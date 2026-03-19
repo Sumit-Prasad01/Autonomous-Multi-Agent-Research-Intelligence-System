@@ -1,0 +1,13 @@
+from src.research_intelligence_system.config.configuration import ConfigurationManager
+from src.research_intelligence_system.components.model_trainer import TrainerPipeline
+
+class ModelTrainerTrainingPipeline:
+    def __init__(self):
+        pass
+
+    def initiate_model_trainer(self):
+
+        config = ConfigurationManager()
+        model_trainer_config = config.get_model_trainer_config()
+        model_trainer = TrainerPipeline(config=model_trainer_config)
+        model_trainer.train()

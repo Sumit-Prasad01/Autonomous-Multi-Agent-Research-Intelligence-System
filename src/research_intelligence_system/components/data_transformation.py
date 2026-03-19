@@ -1,144 +1,193 @@
-import re
 import os
-import pandas as pd
-from tqdm import tqdm
-from datasets import load_dataset
-from transformers import T5Tokenizer
+import re
+from datasets import load_dataset, DatasetDict
+from transformers import AutoTokenizer
+from dataclasses import dataclass
+from src.research_intelligence_system.entity import DataTransformationConfig
 from src.research_intelligence_system.utils.logger import get_logger
-from src.research_intelligence_system.config.configuration import DataTransformationConfig
-
 
 logger = get_logger(__name__)
 
-
 class DataTransformation:
 
-    def __init__(self, config=DataTransformationConfig):
+    def __init__(self, config: DataTransformationConfig):
         self.config = config
-        self.tokenizer = T5Tokenizer.from_pretrained(config.tokenizer_name)
 
-        self.MAX_INPUT_TOKENS = 512
-        self.CHUNK_SIZE = 350
-        self.OVERLAP = 80
+        # Ensure online mode
+        os.environ["HF_HUB_OFFLINE"] = "0"
+        os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.tokenizer_name,
+            cache_dir="./hf_cache",
+            local_files_only=False
+        )
 
 
+    def clean_text(self, text):
+        if text is None:
+            return ""
 
-    def clean_text(self, text: str) -> str:
+        if not isinstance(text, str):
+            text = str(text)
+
         text = re.sub(r'@xcite', '', text)
         text = re.sub(r'@xmath\d+', '', text)
-
         text = text.replace("\n", " ")
 
         text = re.sub(r'\s+,', ',', text)
         text = re.sub(r'\s+\.', '.', text)
         text = re.sub(r'\s*-\s*', '-', text)
-
         text = re.sub(r'\s+', ' ', text)
+
         return text.strip().lower()
 
 
+    def load_data(self):
+        dataset = load_dataset("csv", data_files=self.config.data_path)
+        return dataset
 
-    def chunk_text(self, text):
-        tokens = self.tokenizer(
-            text,
-            add_special_tokens=False,
-            return_attention_mask=False
-        )["input_ids"]
 
-        chunks = []
-        start = 0
+    def apply_cleaning(self, dataset):
 
-        while start < len(tokens):
-            end = start + self.CHUNK_SIZE
-            chunk_tokens = tokens[start:end]
+        def clean_batch(example):
+            return {
+                "input_text": self.clean_text(example.get("text")),
+                "target_text": self.clean_text(example.get("summary"))
+            }
 
-            if len(chunk_tokens) == 0:
-                break
+        dataset = dataset.map(clean_batch)
 
-            chunk_text = self.tokenizer.decode(
-                chunk_tokens,
-                skip_special_tokens=True
+        # Remove original columns safely
+        cols_to_remove = [col for col in ["text", "summary"] if col in dataset["train"].column_names]
+        dataset = dataset.remove_columns(cols_to_remove)
+
+        return dataset
+
+
+    def filter_dataset(self, dataset):
+
+        def filter_empty(example):
+            return (
+                example["input_text"] is not None and example["input_text"].strip() != "" and
+                example["target_text"] is not None and example["target_text"].strip() != ""
             )
 
-            chunks.append(chunk_text)
-
-            start += self.CHUNK_SIZE - self.OVERLAP
-
-        return chunks
+        return dataset.filter(filter_empty)
 
 
-    def preprocess(self, input_path, output_path):
-        df = pd.read_csv(input_path)
+    def tokenize_function(self, examples):
 
-        inputs = []
-        targets = []
+        inputs = ["summarize: " + text for text in examples["input_text"]]
 
-        for _, row in tqdm(df.iterrows(), total=len(df)):
-            raw_text = str(row["text"])
-            raw_summary = str(row["summary"])
+        model_inputs = self.tokenizer(
+            inputs,
+            max_length=self.config.max_input_length,
+            truncation=True,
+            stride=self.config.stride,
+            return_overflowing_tokens=True,
+            padding="max_length"
+        )
 
-            clean_txt = self.clean_text(raw_text)
-            clean_sum = self.clean_text(raw_summary)
+        # Tokenize targets
+        labels = self.tokenizer(
+            examples["target_text"],
+            max_length=self.config.max_target_length,
+            truncation=True,
+            padding="max_length"
+        )
 
-            if len(clean_txt) < 50:
-                continue
+        # Map overflow chunks to correct labels
+        sample_mapping = model_inputs.pop("overflow_to_sample_mapping")
 
-            chunks = self.chunk_text(clean_txt)
+        model_inputs["labels"] = [
+            labels["input_ids"][i] for i in sample_mapping
+        ]
 
-            for chunk in chunks:
-                inputs.append(f"summarize: {chunk}")
-                targets.append(clean_sum)
+        return model_inputs
 
-        final_df = pd.DataFrame({
-            "input_text": inputs,
-            "target_text": targets
-        })
+    def validate_dataset(self, dataset):
 
-        final_df.to_csv(output_path, index=False)
+        stats = {
+            "total": 0,
+            "valid": 0,
+            "removed_empty": 0,
+            "removed_short": 0,
+            "avg_input_length": 0
+        }
 
-        logger.info(f"CSV Ready! Size: {len(final_df)}")
+        lengths = []
+
+        def validate(example):
+            stats["total"] += 1
+
+            input_text = example["input_text"]
+            target_text = example["target_text"]
+
+            #Empty check
+            if not input_text or not target_text:
+                stats["removed_empty"] += 1
+                return False
+
+            #Too short
+            if len(input_text) < 30:
+                stats["removed_short"] += 1
+                return False
+
+            lengths.append(len(input_text))
+            stats["valid"] += 1
+
+            return True
+
+            dataset = dataset.filter(validate)
+
+        #Metrics
+        if lengths:
+            stats["avg_input_length"] = sum(lengths) / len(lengths)
+
+        return dataset, stats
 
 
+    def log_stats(self, stats):
 
-    def tokenize_dataset(self, csv_path, save_path):
+        print("\n📊 DATASET QUALITY REPORT")
+        print(f"Total samples: {stats['total']}")
+        print(f"Valid samples: {stats['valid']}")
+        print(f"Removed (empty): {stats['removed_empty']}")
+        print(f"Removed (too short): {stats['removed_short']}")
+        print(f"Avg input length: {stats['avg_input_length']:.2f}")
 
-        dataset = load_dataset("csv", data_files=csv_path)
 
-        def tokenize_function(example):
-            model_inputs = self.tokenizer(
-                example["input_text"],
-                max_length=512,
-                truncation=True,        
-                padding="max_length"
-            )
+    def transform(self):
 
-            labels = self.tokenizer(
-                example["target_text"],
-                max_length=128,
-                truncation=True,
-                padding="max_length"
-            )
+        os.makedirs(self.config.root_dir, exist_ok=True)
 
-            model_inputs["labels"] = labels["input_ids"]
-            return model_inputs
+        print(" Loading dataset...")
+        dataset = self.load_data()
 
+        print(" Cleaning dataset...")
+        dataset = self.apply_cleaning(dataset)
+
+ 
+
+        print("🧪 Validating dataset...")
+        dataset, stats = self.validate_dataset(dataset)
+
+        self.log_stats(stats)
+
+        print(" Filtering empty rows...")
+        dataset = self.filter_dataset(dataset)
+
+        print(" Tokenizing dataset...")
         tokenized_dataset = dataset.map(
-            tokenize_function,
+            self.tokenize_function,
             batched=True,
             remove_columns=["input_text", "target_text"]
         )
 
+        save_path = os.path.join(self.config.root_dir, "tokenized_dataset")
         tokenized_dataset.save_to_disk(save_path)
 
-        logger.info("Tokenized dataset saved successfully!")
+        print(f" Tokenized dataset saved at: {save_path}")
 
-
-    def transform(self):
-        os.makedirs(self.config.root_dir, exist_ok=True)
-
-        csv_path = os.path.join(self.config.root_dir, "cleaned.csv")
-        tokenized_path = os.path.join(self.config.root_dir, "tokenized")
-
-        self.preprocess(self.config.data_path, csv_path)
-
-        self.tokenize_dataset(csv_path, tokenized_path)
+        return tokenized_dataset

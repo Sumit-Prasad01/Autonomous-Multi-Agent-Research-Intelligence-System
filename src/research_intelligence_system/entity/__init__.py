@@ -8,8 +8,36 @@ class DataIngestionConfig:
     unzip_dir : Path
 
 
+
 @dataclass
 class DataTransformationConfig:
+    root_dir: Path
+    data_path: Path
+    tokenizer_name: Path
+    max_input_length: int = 512
+    max_target_length: int = 128
+    stride: int = 80
+
+
+@dataclass
+class ModelTrainerConfig:
     root_dir : Path
     data_path : Path
-    tokenizer_name : Path
+    model_ckpt : Path
+    num_train_epochs : int
+    warmup_steps : int
+    per_device_train_batch_size : int
+    weight_decay : float
+    logging_steps : int
+    evaluation_strategy : str
+    eval_steps : int
+    save_steps : float
+    gradient_accumulation_steps : int
+
+@dataclass
+class ModelEvaluationConfig:
+    root_dir: Path
+    data_path: Path
+    model_path: Path
+    tokenizer_path: Path
+    metric_file_name: Path

@@ -32,3 +32,4 @@ transformers
 uvicorn
 torch
 rank_bm25
+peft

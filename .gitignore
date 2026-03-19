@@ -143,3 +143,5 @@ logs/
 
 artifacts/
 data/
+
+hf_cache/
