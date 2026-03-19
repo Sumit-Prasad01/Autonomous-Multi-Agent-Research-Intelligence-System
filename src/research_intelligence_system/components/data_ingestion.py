@@ -4,7 +4,7 @@ from datasets import load_dataset
 
 from src.research_intelligence_system.utils.logger import get_logger
 from src.research_intelligence_system.utils.custom_exception import CustomException
-from research_intelligence_system.config.settings import settings
+from src.research_intelligence_system.config.settings import settings
 
 logger = get_logger(__name__)
 

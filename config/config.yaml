@@ -6,3 +6,8 @@ data_ingestion:
   unzip_dir: artifacts/data_ingestion/arxiv_dataset
 
 
+data_transformation:
+  root_dir: artifacts/data_transformation
+  data_path: artifacts/data_ingestion/arxiv_dataset/train.csv
+  tokenizer_name: t5-small
+

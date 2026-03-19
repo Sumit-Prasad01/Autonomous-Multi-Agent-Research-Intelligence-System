@@ -1,5 +1,5 @@
 from src.research_intelligence_system.config.configuration import ConfigurationManager
-from src.research_intelligence_system.components.summarization_model_finetuning.data_ingestion import DataIngestion
+from src.research_intelligence_system.components.data_ingestion import DataIngestion
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
