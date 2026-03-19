@@ -31,3 +31,4 @@ tqdm
 transformers
 uvicorn
 torch
+rank_bm25

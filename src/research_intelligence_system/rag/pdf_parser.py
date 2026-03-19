@@ -1,56 +1,121 @@
 import os
-from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader 
+import re
+from typing import List
+
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_classic.text_splitter import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 
 from src.research_intelligence_system.utils.logger import get_logger
 from src.research_intelligence_system.utils.custom_exception import CustomException
-from src.research_intelligence_system.constants import PDF_PATH, CHUNK_OVERLAP, CHUNK_SIZE
-
+from src.research_intelligence_system.constants import CHUNK_OVERLAP, CHUNK_SIZE
+from src.research_intelligence_system.agents.parsing_agent import ParsingAgent
 
 logger = get_logger(__name__)
 
-def load_pdf_file():
+
+# ---------- CLEAN TEXT ----------
+def clean_text(text: str) -> str:
+    """
+    Remove noise from PDF text
+    """
+    if not text:
+        return ""
+
+    # remove excessive whitespace
+    text = re.sub(r"\s+", " ", text)
+
+    # remove weird characters
+    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+
+    # remove references section (optional improvement)
+    text = re.sub(r"References.*", "", text, flags=re.IGNORECASE)
+
+    return text.strip()
+
+
+# ---------- LOAD PDF ----------
+def load_pdf_file(pdf_path: str) -> List[Document]:
     try:
+        if not os.path.exists(pdf_path):
+            raise CustomException(f"File does not exist: {pdf_path}")
 
-        if not os.path.exists(PDF_PATH):
-            raise CustomException("Data path does not exists.")
-        
-        logger.info(f"Loading files from {PDF_PATH}")
+        logger.info(f"[PDF LOAD] path={pdf_path}")
 
-        loader = DirectoryLoader(PDF_PATH, glob = "*.pdf", loader_cls = PyPDFLoader)
-
+        loader = PyPDFLoader(pdf_path)
         documents = loader.load()
 
         if not documents:
-            logger.warning("No PDFs were found.")
-        else:
-            logger.info(f"Successfully fetched {len(documents)} documents.")
+            raise CustomException("No content extracted from PDF.")
 
-        return documents
-    
+        # clean page content
+        cleaned_docs = []
+        for doc in documents:
+            cleaned_text = clean_text(doc.page_content)
+
+            if len(cleaned_text) < 30:
+                continue
+
+            cleaned_docs.append(
+                Document(
+                    page_content=cleaned_text,
+                    metadata=doc.metadata
+                )
+            )
+
+        logger.info(f"Loaded {len(cleaned_docs)} cleaned pages")
+
+        return cleaned_docs
+
     except Exception as e:
-        error_message = CustomException("Failed o load PDFs.", e)
-        logger.error(str(error_message))
+        logger.exception("PDF loading failed")
         return []
-    
 
-def create_text_chunks(documents):
+
+# ---------- CHUNKING ----------
+def create_text_chunks(documents: List[Document]) -> List[Document]:
     try:
-
         if not documents:
             raise CustomException("No documents were found.")
-        
-        logger.info(f"Splitting {len(documents)} documents into chunks.")
 
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size = CHUNK_SIZE, chunk_overlap = CHUNK_OVERLAP)
+        logger.info(f"[PARSING] documents={len(documents)}")
 
-        text_chunks = text_splitter.split_documents(documents)
+        # ---------- STRUCTURED PARSING ----------
+        parser = ParsingAgent()
+        parsed_documents = parser.parse_documents(documents)
 
-        logger.info(f"Generated {len(text_chunks)} text chunks.")
+        logger.info("Parsing completed → chunking started")
 
-        return text_chunks
+        # ---------- SMART SPLITTING ----------
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=[
+                "\n\n", "\n", ".", " ", ""   #better semantic splitting
+            ]
+        )
+
+        chunks = text_splitter.split_documents(parsed_documents)
+
+        # ---------- CLEAN CHUNKS ----------
+        cleaned_chunks = []
+        for chunk in chunks:
+            text = chunk.page_content.strip()
+
+            if len(text) < 50:
+                continue
+
+            cleaned_chunks.append(
+                Document(
+                    page_content=text,
+                    metadata=chunk.metadata
+                )
+            )
+
+        logger.info(f"Generated {len(cleaned_chunks)} clean chunks")
+
+        return cleaned_chunks
 
     except Exception as e:
-        error_mesasge = CustomException("Failed to generate text chunks.", e)
-        logger.error(str(error_mesasge))
+        logger.error(f"Chunking failed: {str(e)}")
         return []

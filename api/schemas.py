@@ -1,18 +1,17 @@
 from pydantic import BaseModel, Field
-from typing import List
-
+from typing import List, Literal
 
 
 class Message(BaseModel):
-    content: str = Field(..., min_length=1)
-
+    role: Literal["user", "assistant", "system"]
+    content: str = Field(..., min_length=1, max_length=5000)
 
 
 class ChatRequest(BaseModel):
+    chat_id: str = Field(..., min_length=1)
     llm_id: str = Field(..., min_length=1)
     allow_search: bool = False
     messages: List[Message]
-
 
 
 class ChatResponse(BaseModel):
