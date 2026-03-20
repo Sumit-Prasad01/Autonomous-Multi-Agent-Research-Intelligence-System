@@ -14,7 +14,7 @@ class DataTransformationConfig:
     root_dir: Path
     data_path: Path
     tokenizer_name: Path
-    max_input_length: int = 512
+    max_input_length: int = 256
     max_target_length: int = 128
     stride: int = 80
 
@@ -30,7 +30,7 @@ class ModelTrainerConfig:
     weight_decay : float
     logging_steps : int
     evaluation_strategy : str
-    eval_steps : int
+    # eval_steps : int
     save_steps : float
     gradient_accumulation_steps : int
 

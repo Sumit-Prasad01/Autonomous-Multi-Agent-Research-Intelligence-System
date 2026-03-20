@@ -125,3 +125,12 @@ Tokenize (HF Overflow)
    ↓
 Save Dataset
 ```
+
+### Agentic Rag
+```
+Async Artitecture
+Event Driven
+Distributed 
+Caching
+Chat Memory
+```

@@ -1,8 +1,7 @@
 import os
 import re
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset
 from transformers import AutoTokenizer
-from dataclasses import dataclass
 from src.research_intelligence_system.entity import DataTransformationConfig
 from src.research_intelligence_system.utils.logger import get_logger
 
@@ -13,7 +12,6 @@ class DataTransformation:
     def __init__(self, config: DataTransformationConfig):
         self.config = config
 
-        # Ensure online mode
         os.environ["HF_HUB_OFFLINE"] = "0"
         os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
@@ -22,7 +20,6 @@ class DataTransformation:
             cache_dir="./hf_cache",
             local_files_only=False
         )
-
 
     def clean_text(self, text):
         if text is None:
@@ -58,7 +55,6 @@ class DataTransformation:
 
         dataset = dataset.map(clean_batch)
 
-        # Remove original columns safely
         cols_to_remove = [col for col in ["text", "summary"] if col in dataset["train"].column_names]
         dataset = dataset.remove_columns(cols_to_remove)
 
@@ -69,42 +65,12 @@ class DataTransformation:
 
         def filter_empty(example):
             return (
-                example["input_text"] is not None and example["input_text"].strip() != "" and
-                example["target_text"] is not None and example["target_text"].strip() != ""
+                example["input_text"] and example["input_text"].strip() != "" and
+                example["target_text"] and example["target_text"].strip() != ""
             )
 
         return dataset.filter(filter_empty)
 
-
-    def tokenize_function(self, examples):
-
-        inputs = ["summarize: " + text for text in examples["input_text"]]
-
-        model_inputs = self.tokenizer(
-            inputs,
-            max_length=self.config.max_input_length,
-            truncation=True,
-            stride=self.config.stride,
-            return_overflowing_tokens=True,
-            padding="max_length"
-        )
-
-        # Tokenize targets
-        labels = self.tokenizer(
-            examples["target_text"],
-            max_length=self.config.max_target_length,
-            truncation=True,
-            padding="max_length"
-        )
-
-        # Map overflow chunks to correct labels
-        sample_mapping = model_inputs.pop("overflow_to_sample_mapping")
-
-        model_inputs["labels"] = [
-            labels["input_ids"][i] for i in sample_mapping
-        ]
-
-        return model_inputs
 
     def validate_dataset(self, dataset):
 
@@ -124,29 +90,24 @@ class DataTransformation:
             input_text = example["input_text"]
             target_text = example["target_text"]
 
-            #Empty check
             if not input_text or not target_text:
                 stats["removed_empty"] += 1
                 return False
 
-            #Too short
             if len(input_text) < 30:
                 stats["removed_short"] += 1
                 return False
 
             lengths.append(len(input_text))
             stats["valid"] += 1
-
             return True
 
-            dataset = dataset.filter(validate)
+        dataset = dataset.filter(validate)   
 
-        #Metrics
         if lengths:
             stats["avg_input_length"] = sum(lengths) / len(lengths)
 
         return dataset, stats
-
 
     def log_stats(self, stats):
 
@@ -158,27 +119,47 @@ class DataTransformation:
         print(f"Avg input length: {stats['avg_input_length']:.2f}")
 
 
+    def tokenize_function(self, examples):
+
+        inputs = ["summarize: " + text for text in examples["input_text"]]
+
+        model_inputs = self.tokenizer(
+            inputs,
+            max_length=self.config.max_input_length,   
+            truncation=True,
+            padding=False   
+        )
+
+        labels = self.tokenizer(
+            examples["target_text"],
+            max_length=self.config.max_target_length,  
+            truncation=True,
+            padding=False
+        )
+
+        model_inputs["labels"] = labels["input_ids"]
+
+        return model_inputs
+
+
     def transform(self):
 
         os.makedirs(self.config.root_dir, exist_ok=True)
 
-        print(" Loading dataset...")
+        logger.info("Loading dataset...")
         dataset = self.load_data()
 
-        print(" Cleaning dataset...")
+        logger.info("Cleaning dataset...")
         dataset = self.apply_cleaning(dataset)
 
- 
-
-        print("🧪 Validating dataset...")
+        logger.info("Validating dataset...")
         dataset, stats = self.validate_dataset(dataset)
-
         self.log_stats(stats)
 
-        print(" Filtering empty rows...")
+        logger.info("Filtering empty rows...")
         dataset = self.filter_dataset(dataset)
 
-        print(" Tokenizing dataset...")
+        logger.info("Tokenizing dataset...")
         tokenized_dataset = dataset.map(
             self.tokenize_function,
             batched=True,
@@ -188,6 +169,6 @@ class DataTransformation:
         save_path = os.path.join(self.config.root_dir, "tokenized_dataset")
         tokenized_dataset.save_to_disk(save_path)
 
-        print(f" Tokenized dataset saved at: {save_path}")
+        logger.info(f"Tokenized dataset saved at: {save_path}")
 
         return tokenized_dataset

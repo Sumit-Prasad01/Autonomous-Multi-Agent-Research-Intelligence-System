@@ -1,95 +1,63 @@
+from __future__ import annotations
+
 import asyncio
 from typing import List
 
+from src.research_intelligence_system.rag.pdf_parser import parse_pdf
 from src.research_intelligence_system.rag.vector_store import (
-    add_documents_to_vector_store,
-    refresh_vector_store_cache
+    async_add_documents,
+    refresh_vector_store_cache,
 )
-from src.research_intelligence_system.rag.pdf_parser import (
-    load_pdf_file,
-    create_text_chunks
-)
-from src.research_intelligence_system.utils.logger import get_logger
+from src.research_intelligence_system.rag.retriever import invalidate_retriever_cache
 from src.research_intelligence_system.utils.custom_exception import CustomException
+from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
-# ---------- CONFIG ----------
-BATCH_SIZE = 64   # controls memory + speed
+BATCH_SIZE = 64
 
 
-# ---------- ASYNC WRAPPERS ----------
-async def load_pdf_async(pdf_path: str):
-    return await asyncio.to_thread(load_pdf_file, pdf_path)
+def _batch(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
 
 
-async def chunk_docs_async(documents):
-    return await asyncio.to_thread(create_text_chunks, documents)
-
-
-async def store_batch_async(batch, chat_id: str):
-    return await asyncio.to_thread(add_documents_to_vector_store, batch, chat_id)
-
-
-# ---------- BATCHING ----------
-def batch_chunks(chunks: List, batch_size: int):
-    for i in range(0, len(chunks), batch_size):
-        yield chunks[i:i + batch_size]
-
-
-# ---------- MAIN PIPELINE ----------
-async def ingest_pdf(chat_id: str, pdf_path: str):
+async def ingest_pdf(chat_id: str, pdf_path: str) -> bool:
     """
-    🚀 Production Ingestion Pipeline:
-    - Async execution
-    - Batch processing
-    - Metadata enforced
-    - Scalable for large PDFs
+    Load → clean → chunk → store (batched parallel) → bust caches.
+    parse_pdf already handles file-hash caching & async parsing.
     """
-
     try:
-        logger.info(f"[INGESTION] chat_id={chat_id}")
-        logger.info(f"[PDF] path={pdf_path}")
+        logger.info(f"[INGEST] start chat_id={chat_id} path={pdf_path}")
 
-        # ---------- LOAD ----------
-        documents = await load_pdf_async(pdf_path)
-
-        if not documents:
-            raise CustomException("No documents loaded from PDF.")
-
-        logger.info(f"Loaded {len(documents)} pages")
-
-        # ---------- CHUNK ----------
-        chunks = await chunk_docs_async(documents)
+        # single await: load + clean + chunk (all async inside parse_pdf)
+        chunks = await parse_pdf(pdf_path, chat_id=chat_id)
 
         if not chunks:
-            raise CustomException("Chunking failed.")
+            raise CustomException("No chunks produced from PDF.")
 
-        logger.info(f"Generated {len(chunks)} chunks")
+        logger.info(f"[INGEST] {len(chunks)} chunks → storing in batches …")
 
-        # ---------- METADATA ----------
-        for chunk in chunks:
-            if not hasattr(chunk, "metadata") or chunk.metadata is None:
-                chunk.metadata = {}
+        # parallel batch writes to vector store
+        await asyncio.gather(*[
+            async_add_documents(batch, chat_id)
+            for batch in _batch(chunks, BATCH_SIZE)
+        ])
 
-            chunk.metadata["chat_id"] = chat_id
+        # bust BM25 cache for this chat so retriever rebuilds with new docs
+        invalidate_retriever_cache(chat_id)
 
-        # ---------- BATCH STORE ----------
-        tasks = []
-
-        for batch in batch_chunks(chunks, BATCH_SIZE):
-            tasks.append(store_batch_async(batch, chat_id))
-
-        await asyncio.gather(*tasks)
-
-        # ---------- REFRESH CACHE ----------
-        await asyncio.to_thread(refresh_vector_store_cache)
-
-        logger.info("Ingestion completed successfully.")
-
+        logger.info(f"[INGEST] done chat_id={chat_id}")
         return True
 
     except Exception as e:
-        logger.exception("Ingestion pipeline failed.")
+        logger.exception("[INGEST] pipeline failed")
         raise CustomException("PDF ingestion failed.", e)
+
+
+async def ingest_multiple(chat_id: str, pdf_paths: List[str]) -> List[bool]:
+    """Ingest multiple PDFs for a chat concurrently."""
+    return list(await asyncio.gather(
+        *[ingest_pdf(chat_id, p) for p in pdf_paths],
+        return_exceptions=True,
+    ))

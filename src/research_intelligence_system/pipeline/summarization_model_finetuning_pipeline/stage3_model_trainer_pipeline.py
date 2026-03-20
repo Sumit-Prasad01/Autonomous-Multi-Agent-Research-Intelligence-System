@@ -1,5 +1,5 @@
 from src.research_intelligence_system.config.configuration import ConfigurationManager
-from src.research_intelligence_system.components.model_trainer import TrainerPipeline
+from src.research_intelligence_system.components.model_trainer import ModelTrainer
 
 class ModelTrainerTrainingPipeline:
     def __init__(self):
@@ -9,5 +9,5 @@ class ModelTrainerTrainingPipeline:
 
         config = ConfigurationManager()
         model_trainer_config = config.get_model_trainer_config()
-        model_trainer = TrainerPipeline(config=model_trainer_config)
+        model_trainer = ModelTrainer(config=model_trainer_config)
         model_trainer.train()

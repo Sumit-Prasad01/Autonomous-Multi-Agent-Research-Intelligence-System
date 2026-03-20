@@ -1,146 +1,226 @@
-from functools import lru_cache
+from __future__ import annotations
+
+import asyncio
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional
 
+import faiss
+import numpy as np
+from langchain_classic.schema import Document
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 
 from src.research_intelligence_system.constants import DB_FAISS_PATH, HF_MODEL_NAME
-from src.research_intelligence_system.utils.logger import get_logger
 from src.research_intelligence_system.utils.custom_exception import CustomException
+from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-FAISS_INDEX_PATH = DB_FAISS_PATH
+# ── Config ───────────────────────────────────────────────────────────────────
+EMBED_BATCH_SIZE      = 64
+IVF_THRESHOLD         = 10_000
+IVF_NLIST, IVF_NPROBE = 128, 16
+_POOL                 = ThreadPoolExecutor(max_workers=4, thread_name_prefix="faiss")
 
-# Thread lock for safe writes
-faiss_lock = threading.Lock()
 
-
-# ---------- EMBEDDINGS ----------
-@lru_cache(maxsize=1)
-def load_embeddings():
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def _detect_device() -> str:
     try:
-        logger.info("Loading embedding model (cached)")
-
-        return HuggingFaceEmbeddings(
-            model_name=HF_MODEL_NAME,
-            model_kwargs={
-                "local_files_only": True
-            },
-            encode_kwargs={
-                "normalize_embeddings": True  #improves similarity search
-            }
-        )
-
-    except Exception as e:
-        logger.exception("Embedding load failed")
-        raise CustomException("Embedding model loading failed", e)
+        import torch
+        if torch.cuda.is_available():         return "cuda"
+        if torch.backends.mps.is_available(): return "mps"
+    except ImportError:
+        pass
+    return "cpu"
 
 
-# ---------- VECTOR STORE ----------
-@lru_cache(maxsize=1)
-def load_vector_store():
-    try:
-        embeddings = load_embeddings()
-
-        if os.path.exists(FAISS_INDEX_PATH):
-            logger.info("Loading existing FAISS index")
-
-            db = FAISS.load_local(
-                FAISS_INDEX_PATH,
-                embeddings,
-                allow_dangerous_deserialization=True
-            )
-        else:
-            logger.warning("No FAISS index found → initializing empty store")
-
-            db = FAISS.from_texts(
-                ["initial placeholder"],
-                embedding=embeddings
-            )
-
-        return db
-
-    except Exception as e:
-        logger.exception("Failed to load vector store.")
-        raise CustomException("Vector store loading failed.", e)
+def _build_embeddings() -> HuggingFaceEmbeddings:
+    return HuggingFaceEmbeddings(
+        model_name=HF_MODEL_NAME,
+        model_kwargs={"device": _detect_device()},
+        encode_kwargs={"normalize_embeddings": True, "batch_size": EMBED_BATCH_SIZE},
+    )
 
 
-# ---------- ADD DOCUMENTS ----------
-def add_documents_to_vector_store(text_chunks, chat_id):
-    """
-    🚀 Production-safe document ingestion:
-    - Thread-safe writes
-    - Metadata enforced
-    - Persistent storage
-    """
+def _upgrade_to_ivf(db: FAISS) -> None:
+    """Upgrade flat index → IVFFlat once collection crosses threshold."""
+    n = db.index.ntotal
+    if isinstance(db.index, faiss.IndexIVFFlat):
+        db.index.nprobe = IVF_NPROBE
+        return
+    if n < IVF_THRESHOLD:
+        return
 
-    try:
-        if not text_chunks:
-            raise CustomException("No chunks provided for indexing.")
-
-        logger.info(f"[VECTOR STORE] Adding docs for chat_id={chat_id}")
-
-        db = load_vector_store()
-
-        for chunk in text_chunks:
-            if not hasattr(chunk, "metadata") or chunk.metadata is None:
-                chunk.metadata = {}
-
-            chunk.metadata["chat_id"] = chat_id
-
-        # thread-safe FAISS update
-        with faiss_lock:
-            db.add_documents(text_chunks)
-            db.save_local(FAISS_INDEX_PATH)
-
-        logger.info("Documents successfully added and saved.")
-
-    except Exception as e:
-        logger.exception("Failed to add documents.")
-        raise CustomException("Failed to update vector store", e)
+    logger.info(f"Upgrading to IVFFlat (n={n}) …")
+    d   = db.index.d
+    idx = faiss.IndexIVFFlat(faiss.IndexFlatL2(d), d, IVF_NLIST, faiss.METRIC_L2)
+    idx.nprobe = IVF_NPROBE
+    vecs = np.zeros((n, d), dtype="float32")
+    db.index.reconstruct_n(0, n, vecs)
+    idx.train(vecs); idx.add(vecs)
+    db.index = idx
+    logger.info("IVFFlat upgrade done.")
 
 
-# ---------- DELETE BY CHAT ----------
-def delete_documents_by_chat(chat_id: str):
-    """
-    Future-ready cleanup (important for production)
-    """
+# ── Store Manager (Singleton + RW-lock) ──────────────────────────────────────
+class VectorStoreManager:
+    _instance: Optional["VectorStoreManager"] = None
+    _init_lock = threading.Lock()
 
-    try:
-        logger.info(f"[VECTOR STORE] Deleting docs for chat_id={chat_id}")
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._setup()
+        return cls._instance
 
-        db = load_vector_store()
+    def _setup(self):
+        self._db: Optional[FAISS]                    = None
+        self._embeddings: Optional[HuggingFaceEmbeddings] = None
+        self._wlock   = threading.Lock()
+        self._rlock   = threading.Lock()
+        self._rcnt    = 0
+        self._no_rdr  = threading.Event()
+        self._no_rdr.set()
 
-        with faiss_lock:
-            # FAISS doesn't support direct delete → rebuild index
-            all_docs = list(db.docstore._dict.values())
+    # ── RW guards ────────────────────────────────────────────────────────────
+    def _r_acquire(self):
+        with self._rlock:
+            self._rcnt += 1
+            self._no_rdr.clear()
 
-            remaining_docs = [
-                doc for doc in all_docs
-                if doc.metadata.get("chat_id") != chat_id
-            ]
+    def _r_release(self):
+        with self._rlock:
+            self._rcnt -= 1
+            if not self._rcnt: self._no_rdr.set()
 
-            embeddings = load_embeddings()
+    def _w_acquire(self): self._no_rdr.wait(); self._wlock.acquire()
+    def _w_release(self): self._wlock.release()
 
-            new_db = FAISS.from_documents(remaining_docs, embeddings)
-            new_db.save_local(FAISS_INDEX_PATH)
+    # ── Lazy properties ───────────────────────────────────────────────────────
+    @property
+    def embeddings(self) -> HuggingFaceEmbeddings:
+        if not self._embeddings:
+            self._embeddings = _build_embeddings()
+        return self._embeddings
 
-            # refresh cache
-            load_vector_store.cache_clear()
+    @property
+    def db(self) -> FAISS:
+        if not self._db:
+            self._w_acquire()
+            try:
+                if not self._db:
+                    self._db = (
+                        FAISS.load_local(DB_FAISS_PATH, self.embeddings,
+                                         allow_dangerous_deserialization=True)
+                        if os.path.exists(DB_FAISS_PATH)
+                        else FAISS.from_texts(["__init__"], self.embeddings)
+                    )
+                    logger.info(f"FAISS ready — {self._db.index.ntotal} vectors")
+            finally:
+                self._w_release()
+        return self._db
 
-        logger.info("Documents deleted successfully.")
+    def reload(self):
+        self._w_acquire()
+        try:    self._db = None
+        finally: self._w_release()
 
-    except Exception as e:
-        logger.exception("Failed to delete documents.")
-        raise CustomException("Failed to delete documents", e)
+    # ── Writes ────────────────────────────────────────────────────────────────
+    def add(self, chunks: List[Document], chat_id: str):
+        if not chunks: raise CustomException("No chunks provided.")
+        for c in chunks:
+            c.metadata = {**(c.metadata or {}), "chat_id": chat_id}
+        self._w_acquire()
+        try:
+            for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+                self.db.add_documents(chunks[i: i + EMBED_BATCH_SIZE])
+            _upgrade_to_ivf(self.db)
+            self.db.save_local(DB_FAISS_PATH)
+            logger.info(f"Indexed {len(chunks)} chunks [chat_id={chat_id}]")
+        finally:
+            self._w_release()
+
+    def delete(self, chat_id: str):
+        self._w_acquire()
+        try:
+            ids = [k for k, v in self.db.docstore._dict.items()
+                   if v.metadata.get("chat_id") == chat_id]
+            if not ids:
+                logger.warning(f"No docs for chat_id={chat_id}"); return
+            if hasattr(self.db, "delete"):
+                self.db.delete(ids)
+            else:
+                remaining = [v for v in self.db.docstore._dict.values()
+                             if v.metadata.get("chat_id") != chat_id]
+                self._db = FAISS.from_documents(remaining, self.embeddings)
+            self.db.save_local(DB_FAISS_PATH)
+            logger.info(f"Deleted {len(ids)} vectors [chat_id={chat_id}]")
+        finally:
+            self._w_release()
+
+    # ── Reads ─────────────────────────────────────────────────────────────────
+    def search(self, query: str, k=5, chat_id=None) -> List[Document]:
+        self._r_acquire()
+        try:
+            kw = {"filter": {"chat_id": chat_id}} if chat_id else {}
+            return self.db.similarity_search(query, k=k, **kw)
+        finally: self._r_release()
+
+    def search_with_score(self, query: str, k=5, chat_id=None) -> List[tuple]:
+        self._r_acquire()
+        try:
+            kw = {"filter": {"chat_id": chat_id}} if chat_id else {}
+            return self.db.similarity_search_with_score(query, k=k, **kw)
+        finally: self._r_release()
+
+    def as_retriever(self, **kw): return self.db.as_retriever(**kw)
+
+    @property
+    def vector_count(self) -> int: return self.db.index.ntotal
 
 
-# ---------- CACHE REFRESH ----------
-def refresh_vector_store_cache():
-    """
-    Reload FAISS after updates
-    """
-    logger.info("Refreshing FAISS cache")
-    load_vector_store.cache_clear()
+# ── Module-level singleton & thread pool ─────────────────────────────────────
+_store = VectorStoreManager()
+
+async def _offload(fn, *args):
+    return await asyncio.get_event_loop().run_in_executor(_POOL, fn, *args)
+
+
+# ── Public sync API (drop-in compatible) ─────────────────────────────────────
+def load_vector_store()          -> FAISS:                return _store.db
+def load_embeddings()            -> HuggingFaceEmbeddings: return _store.embeddings
+def get_retriever(**kw):                                   return _store.as_retriever(**kw)
+def get_vector_count()           -> int:                   return _store.vector_count
+def refresh_vector_store_cache() -> None:                  _store.reload()
+
+def add_documents_to_vector_store(chunks: List[Document], chat_id: str) -> None:
+    try:    _store.add(chunks, chat_id)
+    except Exception as e: raise CustomException("Vector store add failed", e)
+
+def delete_documents_by_chat(chat_id: str) -> None:
+    try:    _store.delete(chat_id)
+    except Exception as e: raise CustomException("Vector store delete failed", e)
+
+def similarity_search(query: str, k=5, chat_id=None) -> List[Document]:
+    return _store.search(query, k=k, chat_id=chat_id)
+
+def similarity_search_with_score(query: str, k=5, chat_id=None) -> List[tuple]:
+    return _store.search_with_score(query, k=k, chat_id=chat_id)
+
+
+# ── Public async API ──────────────────────────────────────────────────────────
+async def async_add_documents(chunks: List[Document], chat_id: str) -> None:
+    await _offload(_store.add, chunks, chat_id)
+
+async def async_delete_by_chat(chat_id: str) -> None:
+    await _offload(_store.delete, chat_id)
+
+async def async_search(query: str, k=5, chat_id=None) -> List[Document]:
+    return await _offload(_store.search, query, k, chat_id)
+
+async def async_search_with_score(query: str, k=5, chat_id=None) -> List[tuple]:
+    return await _offload(_store.search_with_score, query, k, chat_id)

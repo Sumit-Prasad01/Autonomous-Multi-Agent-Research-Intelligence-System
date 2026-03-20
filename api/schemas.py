@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 
 class Message(BaseModel):
@@ -18,3 +18,11 @@ class ChatResponse(BaseModel):
     answer: str
     source: str
     confidence: float
+    cached: bool = False
+
+
+class UploadResponse(BaseModel):
+    status: str
+    message: str
+    chat_id: str
+    filename: str
