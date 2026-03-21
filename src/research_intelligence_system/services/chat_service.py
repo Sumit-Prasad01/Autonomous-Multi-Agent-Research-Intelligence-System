@@ -1,31 +1,30 @@
-"""
-chat_service.py — Async, streaming, session-cached chat service
-"""
 from __future__ import annotations
 
 import asyncio
-import hashlib
-from typing import AsyncIterator, Dict, List, Optional
+from typing import AsyncIterator, Dict, List
 
-from src.research_intelligence_system.core.qa_system import run_qa_system, stream_qa
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.research_intelligence_system.constants import MAX_HISTORY, MAX_Q_CHARS
+from src.research_intelligence_system.core.qa_system import (
+    invalidate_qa_cache, run_qa_system, stream_qa
+)
+from src.research_intelligence_system.database.chat_repository import (
+    get_chat_messages, save_message, update_chat_title
+)
+from src.research_intelligence_system.services.redis_service import (
+    clear_memory, get_memory, push_message
+)
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MAX_HISTORY  = 6
-MAX_Q_CHARS  = 1500
 
-# ── Session history cache (chat_id → last built context str) ─────────────────
-_session_cache: Dict[str, str] = {}
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def _build_history(messages: List) -> str:
+def _build_history(messages: List[dict]) -> str:
     return "\n".join(
-        f"{m.role.upper()}: {m.content.strip()}"
+        f"{m['role'].upper()}: {m['content'].strip()}"
         for m in messages[-MAX_HISTORY:]
-        if m.content.strip()
+        if m["content"].strip()
     )
 
 
@@ -40,63 +39,100 @@ def _build_query(history: str, query: str) -> str:
     )
 
 
-def _session_key(chat_id: str, query: str) -> str:
-    return hashlib.md5(f"{chat_id}:{query}".encode()).hexdigest()
+async def process_chat(
+    chat_id: str,
+    user_message: str,
+    llm_id: str,
+    allow_search: bool,
+    db: AsyncSession,
+) -> Dict:
+    memory  = await get_memory(chat_id)
+    history = _build_history(memory)
+    query   = _build_query(history, user_message)
 
+    logger.info(f"[CHAT] chat_id={chat_id} query={user_message!r}")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-async def process_chat(request) -> Dict:
-    if not request.messages:
-        return {"answer": "No input provided.", "source": "none", "confidence": 0.0}
+    # update title BEFORE pushing to memory so not memory check is accurate
+    if not memory:
+        await update_chat_title(db, chat_id, user_message[:60])
 
-    latest   = request.messages[-1].content.strip()
-    history  = _build_history(request.messages[:-1])
-    query    = _build_query(history, latest)
-
-    # cache context for streaming reuse
-    _session_cache[request.chat_id] = history
-
-    logger.info(f"[CHAT] chat_id={request.chat_id} query={latest!r}")
+    await asyncio.gather(
+        push_message(chat_id, "user", user_message),
+        save_message(db, chat_id, "user", user_message),
+    )
 
     try:
-        return await run_qa_system(
+        result = await run_qa_system(
             query=query,
-            chat_id=request.chat_id,
-            llm_id=request.llm_id,
-            allow_search=request.allow_search,
+            chat_id=chat_id,
+            llm_id=llm_id,
+            allow_search=allow_search,
         )
-    except Exception as e:
-        logger.exception("[CHAT] failed")
-        return {"answer": "Something went wrong.", "source": "error", "confidence": 0.0}
+    except Exception:
+        logger.exception("[CHAT] QA failed")
+        result = {"answer": "Something went wrong.", "source": "error", "confidence": 0.0}
+
+    answer = result.get("answer", "")
+
+    # save assistant reply to Redis + Postgres concurrently
+    await asyncio.gather(
+        push_message(chat_id, "assistant", answer),
+        save_message(
+            db, chat_id, "assistant", answer,
+            source=result.get("source", ""),
+            confidence=str(result.get("confidence", "")),
+        ),
+    )
+    return result
 
 
-async def stream_chat(request) -> AsyncIterator[str]:
-    """Streaming variant — yields tokens for SSE / WebSocket delivery."""
-    if not request.messages:
-        yield "No input provided."
-        return
+async def stream_chat(
+    chat_id: str,
+    user_message: str,
+    llm_id: str,
+    allow_search: bool,
+    db: AsyncSession,
+) -> AsyncIterator[str]:
+    memory  = await get_memory(chat_id)
+    history = _build_history(memory)
+    query   = _build_query(history, user_message)
 
-    latest  = request.messages[-1].content.strip()
-    history = _session_cache.get(request.chat_id, _build_history(request.messages[:-1]))
-    query   = _build_query(history, latest)
+    await asyncio.gather(
+        push_message(chat_id, "user", user_message),
+        save_message(db, chat_id, "user", user_message),
+    )
 
-    logger.info(f"[CHAT STREAM] chat_id={request.chat_id}")
-
+    full = ""
     try:
         async for token in stream_qa(
-            query=query,
-            chat_id=request.chat_id,
-            llm_id=request.llm_id,
-            allow_search=request.allow_search,
+            query=query, chat_id=chat_id,
+            llm_id=llm_id, allow_search=allow_search,
         ):
+            full += token
             yield token
-    except Exception as e:
+    except Exception:
         logger.exception("[CHAT STREAM] failed")
         yield "Something went wrong."
 
+    if full:
+        await asyncio.gather(
+            push_message(chat_id, "assistant", full),
+            save_message(db, chat_id, "assistant", full, source="stream"),
+        )
 
-def clear_session(chat_id: Optional[str] = None) -> None:
-    if chat_id:
-        _session_cache.pop(chat_id, None)
-    else:
-        _session_cache.clear()
+
+async def load_chat_history(chat_id: str, db: AsyncSession) -> List[dict]:
+    msgs = await get_chat_messages(db, chat_id)
+    return [
+        {"role": m.role, "content": m.content,
+         "source": m.source, "confidence": m.confidence}
+        for m in msgs
+    ]
+
+
+async def delete_chat_session(chat_id: str) -> None:
+    """Clear Redis memory + QA cache for a chat."""
+    await asyncio.gather(
+        clear_memory(chat_id),
+        asyncio.to_thread(invalidate_qa_cache, chat_id),
+    )

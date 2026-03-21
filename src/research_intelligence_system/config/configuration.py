@@ -54,7 +54,9 @@ class ConfigurationManager:
             weight_decay = params.weight_decay,
             logging_steps = params.logging_steps,
             evaluation_strategy = params.evaluation_strategy,
-            # eval_steps = params.eval_steps,
+            early_stop_paitence = params.early_stop_paitence,
+            val_split_size = params.val_split_size,
+            val_split_seed = params.val_split_seed,
             save_steps = params.save_steps,
             gradient_accumulation_steps = params.gradient_accumulation_steps
         )

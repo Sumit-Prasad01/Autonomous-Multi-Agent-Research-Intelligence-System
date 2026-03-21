@@ -32,4 +32,12 @@ transformers
 uvicorn
 torch
 rank_bm25
-peft
+qdrant-client 
+langchain-qdrant
+sqlalchemy 
+asyncpg 
+alembic 
+redis 
+passlib[bcrypt] 
+python-jose[cryptography] 
+python-multipart

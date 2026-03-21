@@ -11,39 +11,38 @@ from typing import Dict, List, Optional
 from langchain_community.tools.tavily_search import TavilySearchResults
 
 from src.research_intelligence_system.config.settings import settings
-from src.research_intelligence_system.utils.custom_exception import CustomException
+from src.research_intelligence_system.constants import (
+    CACHE_TTL, CB_FAIL_LIMIT, CB_RESET_TIMEOUT, MIN_RESULT_CHARS
+)
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-CACHE_TTL        = 300        # seconds — same query reused for 5 min
-CB_FAIL_LIMIT    = 3          # failures before circuit opens
-CB_RESET_TIMEOUT = 60         # seconds before circuit half-opens
-MIN_RESULT_CHARS = 50
-_POOL            = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tavily")
-
-# ── Result cache (query_hash → (result, timestamp)) ──────────────────────────
-_cache: Dict[str, tuple] = {}
+_POOL       = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tavily")
+_cache:     Dict[str, tuple] = {}
 _cache_lock = threading.Lock()
 
 
 # ── Circuit breaker ───────────────────────────────────────────────────────────
 class _CircuitBreaker:
     def __init__(self, limit: int, reset: float):
-        self._limit, self._reset = limit, reset
-        self._fails = 0
+        self._limit   = limit
+        self._reset   = reset
+        self._fails   = 0
         self._opened_at: Optional[float] = None
-        self._lock = threading.Lock()
+        self._lock    = threading.Lock()
 
     def is_open(self) -> bool:
         with self._lock:
             if self._opened_at and time.time() - self._opened_at > self._reset:
-                self._fails = 0; self._opened_at = None   # half-open
+                self._fails = 0
+                self._opened_at = None
             return self._opened_at is not None
 
     def record_success(self):
-        with self._lock: self._fails = 0; self._opened_at = None
+        with self._lock:
+            self._fails = 0
+            self._opened_at = None
 
     def record_failure(self):
         with self._lock:
@@ -56,7 +55,7 @@ class _CircuitBreaker:
 _cb = _CircuitBreaker(CB_FAIL_LIMIT, CB_RESET_TIMEOUT)
 
 
-# ── Singleton tool ────────────────────────────────────────────────────────────
+# ── Singleton Tavily tool ─────────────────────────────────────────────────────
 class _TavilyTool:
     _instance: Optional[TavilySearchResults] = None
     _lock = threading.Lock()
@@ -75,8 +74,8 @@ class _TavilyTool:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _optimize(query: str) -> str:
     query = re.sub(r"[^\w\s\-]", " ", query.strip())
-    query = re.sub(r"\s+", " ", query)
-    return f"{query} research paper"
+    return re.sub(r"\s+", " ", query) + " research paper"
+
 
 def _clean(results: List[dict]) -> str:
     texts = [
@@ -84,6 +83,7 @@ def _clean(results: List[dict]) -> str:
         if len(r.get("content", "").strip()) >= MIN_RESULT_CHARS
     ]
     return "\n\n".join(texts[: settings.TAVILY_MAX_RESULTS])
+
 
 def _cache_key(query: str) -> str:
     return hashlib.md5(query.lower().encode()).hexdigest()
@@ -97,11 +97,10 @@ def run_web_search(query: str) -> str:
 
     key = _cache_key(query)
     with _cache_lock:
-        if key in _cache:
-            result, ts = _cache[key]
-            if time.time() - ts < CACHE_TTL:
-                logger.info("[WEB SEARCH] cache hit")
-                return result
+        entry = _cache.get(key)
+        if entry and time.time() - entry[1] < CACHE_TTL:
+            logger.info("[WEB SEARCH] cache hit")
+            return entry[0]
 
     try:
         logger.info(f"[WEB SEARCH] query={query!r}")
@@ -119,10 +118,11 @@ def run_web_search(query: str) -> str:
 
 # ── Async wrapper ─────────────────────────────────────────────────────────────
 async def async_web_search(query: str) -> str:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_POOL, run_web_search, query)
 
 
 # ── Cache management ──────────────────────────────────────────────────────────
 def clear_search_cache() -> None:
-    with _cache_lock: _cache.clear()
+    with _cache_lock:
+        _cache.clear()

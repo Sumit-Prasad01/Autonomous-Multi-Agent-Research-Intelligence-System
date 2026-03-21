@@ -5,7 +5,9 @@ TrainingArguments:
   weight_decay: 0.01
   logging_steps: 50
   evaluation_strategy: epoch
-  # eval_steps: 1000
+  early_stop_paitence : 3
+  val_split_size : 0.1
+  val_split_seed : 42
   save_steps: 500
   gradient_accumulation_steps: 4
   

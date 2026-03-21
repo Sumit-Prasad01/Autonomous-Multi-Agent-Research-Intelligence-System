@@ -111,12 +111,12 @@ class DataTransformation:
 
     def log_stats(self, stats):
 
-        print("\n📊 DATASET QUALITY REPORT")
-        print(f"Total samples: {stats['total']}")
-        print(f"Valid samples: {stats['valid']}")
-        print(f"Removed (empty): {stats['removed_empty']}")
-        print(f"Removed (too short): {stats['removed_short']}")
-        print(f"Avg input length: {stats['avg_input_length']:.2f}")
+        logger.info("\n📊 DATASET QUALITY REPORT")
+        logger.info(f"Total samples: {stats['total']}")
+        logger.info(f"Valid samples: {stats['valid']}")
+        logger.info(f"Removed (empty): {stats['removed_empty']}")
+        logger.info(f"Removed (too short): {stats['removed_short']}")
+        logger.info(f"Avg input length: {stats['avg_input_length']:.2f}")
 
 
     def tokenize_function(self, examples):

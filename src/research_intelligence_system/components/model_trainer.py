@@ -35,12 +35,6 @@ class ModelTrainer:
     def train(self):
         device, use_fp16, use_bf16 = self._get_device_and_dtype()
 
-        # ── Hardcoded values (not present in ModelTrainerConfig) ──────────────
-        EARLY_STOP_PATIENCE = 3         # stop if eval_loss doesn't improve for 3 evals
-        VAL_SPLIT_SIZE      = 0.1       # 10% of train data used as validation
-        VAL_SPLIT_SEED      = 42        # reproducible split
-        # ─────────────────────────────────────────────────────────────────────
-
         # Load tokenizer & model
         tokenizer = AutoTokenizer.from_pretrained(self.config.model_ckpt)
         model = AutoModelForSeq2SeqLM.from_pretrained(self.config.model_ckpt).to(device)
@@ -57,8 +51,8 @@ class ModelTrainer:
         logger.info(f"Original train size: {len(dataset['train'])}")
 
         split = dataset["train"].train_test_split(
-            test_size=VAL_SPLIT_SIZE,
-            seed=VAL_SPLIT_SEED
+            test_size=self.config.val_split_size,
+            seed=self.config.val_split_seed
         )
         train_dataset = split["train"]
         val_dataset   = split["test"]  
@@ -109,7 +103,7 @@ class ModelTrainer:
             eval_dataset=val_dataset,
             callbacks=[
                 EarlyStoppingCallback(
-                    early_stopping_patience=EARLY_STOP_PATIENCE
+                    early_stopping_patience=self.config.early_stop_paitence
                 )
             ]
         )

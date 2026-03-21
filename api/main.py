@@ -7,23 +7,29 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from api.router import router
-from src.research_intelligence_system.rag.vector_store import _store
+from src.research_intelligence_system.config.settings import settings
+from src.research_intelligence_system.database.database import init_db
+from src.research_intelligence_system.services.redis_service import get_redis
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-# uvloop is not supported on Windows
-_LOOP    = "uvloop" if sys.platform != "win32" else "asyncio"
-_HTTP    = "httptools"
+_LOOP  = "uvloop" if sys.platform != "win32" else "asyncio"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Warming up vector store …")
-    _ = _store.db
+    logger.info("Starting up …")
+    await init_db()
+    await get_redis()
+    # pre-warm embedding model in background thread so first upload is fast
+    import asyncio
+    from src.research_intelligence_system.rag.vector_store import _store
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, lambda: _store.embeddings)
     logger.info("Ready.")
     yield
     logger.info("Shutting down.")
@@ -32,18 +38,24 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Research Intelligence API",
-        description="Agentic RAG QA system — Groq/Llama + FAISS + BM25 + Tavily",
-        version="2.0.0",
+        version="3.0.0",
         lifespan=lifespan,
+        docs_url="/docs",
+        redoc_url="/redoc",
     )
+
+    # ── Middleware ────────────────────────────────────────────────────────────
+    app.add_middleware(GZipMiddleware, minimum_size=1000)   # compress responses > 1KB
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:8501"],
+        allow_origins=[settings.FRONTEND_ORIGIN_URL],
+        allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
+    # ── Request timing ────────────────────────────────────────────────────────
     @app.middleware("http")
     async def _timing(request: Request, call_next):
         t0  = time.perf_counter()
@@ -53,9 +65,10 @@ def create_app() -> FastAPI:
         logger.info(f"{request.method} {request.url.path} → {res.status_code} ({ms}ms)")
         return res
 
+    # ── Global error handler ──────────────────────────────────────────────────
     @app.exception_handler(Exception)
-    async def _global_error(request: Request, exc: Exception):
-        logger.exception(f"Unhandled error on {request.url.path}")
+    async def _err(request: Request, exc: Exception):
+        logger.exception(f"Unhandled: {request.url.path}")
         return JSONResponse(status_code=500, content={"detail": str(exc)})
 
     app.include_router(router)
@@ -66,11 +79,11 @@ app = create_app()
 
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        "api.main:app",
         host="0.0.0.0",
         port=8000,
         reload=False,
-        workers=1, # Production on a real server with 16 GB+ RAM → workers=2 or workers=4 || Windows dev machine → always workers=1
+        workers=1,
         loop=_LOOP,
-        http=_HTTP,
+        http="httptools",
     )

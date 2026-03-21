@@ -1,28 +1,25 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import List, Literal, Optional
 
+# ── Schemas ───────────────────────────────────────────────────────────────────
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    username: str
+    password: str
 
-class Message(BaseModel):
-    role: Literal["user", "assistant", "system"]
-    content: str = Field(..., min_length=1, max_length=5000)
+class LoginRequest(BaseModel):
+    email:    EmailStr
+    password: str
 
-
-class ChatRequest(BaseModel):
-    chat_id: str = Field(..., min_length=1)
-    llm_id: str = Field(..., min_length=1)
+class ChatCreateRequest(BaseModel):
+    title:        str  = "New Chat"
+    llm_id:       str  = "llama-3.1-8b-instant"
     allow_search: bool = False
-    messages: List[Message]
 
+class ChatMessageRequest(BaseModel):
+    message:      str
+    llm_id:       str  = "llama-3.1-8b-instant"
+    allow_search: bool = False
 
-class ChatResponse(BaseModel):
-    answer: str
-    source: str
-    confidence: float
-    cached: bool = False
-
-
-class UploadResponse(BaseModel):
-    status: str
-    message: str
-    chat_id: str
-    filename: str
+class ChatUpdateRequest(BaseModel):
+    title: str
