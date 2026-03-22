@@ -71,3 +71,4 @@ CACHE_TTL        = 300        # seconds — same query reused for 5 min
 CB_FAIL_LIMIT    = 3          # failures before circuit opens
 CB_RESET_TIMEOUT = 60         # seconds before circuit half-opens
 MIN_RESULT_CHARS = 50
+TAVILY_MAX_RESULTS = 3

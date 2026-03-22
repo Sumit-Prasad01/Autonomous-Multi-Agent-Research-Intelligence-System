@@ -17,6 +17,8 @@ from src.research_intelligence_system.services.redis_service import (
 )
 from src.research_intelligence_system.utils.logger import get_logger
 
+from src.research_intelligence_system.core.qa_system import _fix_formatting
+
 logger = get_logger(__name__)
 
 
@@ -97,6 +99,10 @@ async def stream_chat(
     history = _build_history(memory)
     query   = _build_query(history, user_message)
 
+    # update title on first message
+    if not memory:
+        await update_chat_title(db, chat_id, user_message[:60])
+
     await asyncio.gather(
         push_message(chat_id, "user", user_message),
         save_message(db, chat_id, "user", user_message),
@@ -115,12 +121,13 @@ async def stream_chat(
         yield "Something went wrong."
 
     if full:
+        full = _fix_formatting(full)
         await asyncio.gather(
             push_message(chat_id, "assistant", full),
             save_message(db, chat_id, "assistant", full, source="stream"),
         )
 
-
+        
 async def load_chat_history(chat_id: str, db: AsyncSession) -> List[dict]:
     msgs = await get_chat_messages(db, chat_id)
     return [

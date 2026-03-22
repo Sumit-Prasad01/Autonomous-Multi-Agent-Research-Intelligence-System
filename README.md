@@ -140,3 +140,14 @@ Webhook on ingestion complete (notify frontend without polling)
 Chat export (download chat as PDF/markdown)
 Admin endpoints (user management, usage stats)
 ```
+
+```
+When you're ready for next steps, the remaining improvements from the earlier list are:
+
+Alembic migrations
+Rate limiting on auth
+Token refresh
+Celery for PDF ingestion
+Structured JSON logging
+Prometheus metrics
+```

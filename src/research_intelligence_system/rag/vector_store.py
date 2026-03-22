@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os, threading
 import asyncio
 import hashlib
 import threading
@@ -119,6 +120,7 @@ class VectorStoreManager:
         return cls._instance
 
     def _setup(self):
+        logger.info(f"[VS] init PID={os.getpid()} thread={threading.current_thread().name}")
         self._embeddings: Optional[FastGPUEmbeddings]  = None
         self._client:     Optional[QdrantClient]       = None
         self._db:         Optional[QdrantVectorStore]  = None

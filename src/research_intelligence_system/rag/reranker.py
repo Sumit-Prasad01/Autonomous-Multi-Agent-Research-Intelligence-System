@@ -37,7 +37,7 @@ class _RerankerModel:
             with cls._lock:
                 if cls._instance is None:
                     logger.info("Loading reranker model …")
-                    cls._instance = CrossEncoder(MODEL_NAME)
+                    cls._instance = CrossEncoder(MODEL_NAME, local_files_only=True)
         return cls._instance
 
 

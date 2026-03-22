@@ -220,6 +220,14 @@ def _poll_status(cid: str) -> str:
 
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
+def _fix_streaming_format(text: str) -> str:
+    import re
+    text = re.sub(r'(\S)\s{0,2}(\d+\.\s+\*\*)', r'\1\n\n\2', text)
+    text = re.sub(r'(\S)\s{0,2}(\*\*Summary)', r'\1\n\n\2', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def _stream_answer(cid: str, message: str, llm_id: str, allow_search: bool) -> str:
     placeholder = st.empty()
     placeholder.markdown(THINKING_HTML, unsafe_allow_html=True)
@@ -229,16 +237,18 @@ def _stream_answer(cid: str, message: str, llm_id: str, allow_search: bool) -> s
             f"{BACKEND}/chats/{cid}/stream",
             headers=_headers(),
             json={"message": message, "llm_id": llm_id, "allow_search": allow_search},
-            stream=True, timeout=90,
+            stream=True, timeout=120,
         ) as resp:
             for event in sseclient.SSEClient(resp).events():
                 if event.data == "[DONE]": break
                 if event.data.startswith("[ERROR]"):
                     full = event.data; break
-                full += event.data
+                full += event.data.replace(chr(160), ' ')
                 placeholder.markdown(full + "▌", unsafe_allow_html=True)
+            full = _fix_streaming_format(full)
         placeholder.markdown(full, unsafe_allow_html=True)
         return full
+    
     except Exception:
         r      = _api("post", f"/chats/{cid}/message",
                       json={"message": message, "llm_id": llm_id, "allow_search": allow_search})

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import threading
 import uuid
 from typing import Dict
 
@@ -11,7 +10,7 @@ from fastapi import (APIRouter, Depends, HTTPException, UploadFile, File)
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
-from concurrent.futures import ThreadPoolExecutor
+
 from api.schemas import (
     ChatCreateRequest, ChatMessageRequest, ChatUpdateRequest,
     LoginRequest, RegisterRequest,
@@ -29,19 +28,17 @@ from src.research_intelligence_system.services.auth_service import (
 from src.research_intelligence_system.services.chat_service import (
     delete_chat_session, load_chat_history, process_chat, stream_chat
 )
-from src.research_intelligence_system.services.redis_service import check_redis_health
-from src.research_intelligence_system.utils.logger import get_logger
 from src.research_intelligence_system.services.redis_service import (
     check_redis_health, create_session, get_session, delete_session
 )
-
+from src.research_intelligence_system.utils.logger import get_logger
 
 logger   = get_logger(__name__)
 router   = APIRouter(prefix="/api/v1", tags=["api"])
 security = HTTPBearer()
 
 _ingest_status: Dict[str, Dict] = {}
-_ingest_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ingest")
+
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
 async def get_current_user(
@@ -77,7 +74,8 @@ async def logout(creds: HTTPAuthorizationCredentials = Depends(security)):
     await logout_user(creds.credentials)
     return {"message": "Logged out."}
 
-# ── User Session ─────────────────────────────────────────────────────────────
+
+# ── Session ───────────────────────────────────────────────────────────────────
 @router.get("/auth/session/{session_id}")
 async def restore_session(session_id: str):
     data = await get_session(session_id)
@@ -85,10 +83,12 @@ async def restore_session(session_id: str):
         raise HTTPException(401, "Session expired.")
     return data
 
+
 @router.delete("/auth/session/{session_id}")
 async def remove_session(session_id: str):
     await delete_session(session_id)
     return {"message": "Session deleted."}
+
 
 # ── Chat CRUD ─────────────────────────────────────────────────────────────────
 @router.post("/chats", status_code=201)
@@ -193,7 +193,9 @@ async def stream_message(
                 allow_search=req.allow_search,
                 db=db,
             ):
-                yield f"data: {token}\n\n"
+                if token:
+                    # encode spaces so SSE doesn't strip them
+                    yield f"data: {token.replace(' ', chr(160))}\n\n"
         except Exception as e:
             yield f"data: [ERROR] {e}\n\n"
         yield "data: [DONE]\n\n"
@@ -202,22 +204,16 @@ async def stream_message(
 
 
 # ── PDF upload ────────────────────────────────────────────────────────────────
-def _run_ingest_sync(chat_id: str, file_path: str):
-    """Sync wrapper — runs in threadpool, shares main process memory."""
-    import asyncio
+async def _run_ingest(chat_id: str, file_path: str):
     _ingest_status[chat_id] = {"status": "processing", "error": None}
     try:
         logger.info(f"[INGEST] starting chat_id={chat_id}")
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(ingest_pdf(chat_id=chat_id, pdf_path=file_path))
+        await ingest_pdf(chat_id=chat_id, pdf_path=file_path)
         _ingest_status[chat_id] = {"status": "ready", "error": None}
         logger.info(f"[INGEST] ready chat_id={chat_id}")
     except Exception as e:
         _ingest_status[chat_id] = {"status": "failed", "error": str(e)}
         logger.error(f"[INGEST] failed: {e}", exc_info=True)
-    finally:
-        loop.close()
 
 
 @router.post("/chats/{chat_id}/upload")
@@ -245,8 +241,7 @@ async def upload_pdf(
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(content)
 
-    _ingest_pool.submit(_run_ingest_sync, chat_id, file_path)
-
+    asyncio.get_event_loop().create_task(_run_ingest(chat_id, file_path))
     return {"status": "processing", "filename": safe_name}
 
 

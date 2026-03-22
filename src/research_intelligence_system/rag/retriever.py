@@ -69,6 +69,10 @@ def _build_bm25(chat_id: str) -> BM25Retriever:
         with_payload=True,
         with_vectors=False,
     )
+    if results:
+        logger.info(f"[BM25 DEBUG] first point payload: {results[0].payload}")
+    else:
+        logger.warning(f"[BM25 DEBUG] no points found for chat_id={chat_id}")
 
     docs = []
     for point in results:

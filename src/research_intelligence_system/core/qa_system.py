@@ -46,6 +46,13 @@ def _extract(response) -> str:
         text = str(response)
     return text
 
+def _extract_question(query: str) -> str:
+    if "User Question:" in query:
+        query = query.split("User Question:")[-1].strip()
+    if "\n\nAnswer using" in query:
+        query = query.split("\n\nAnswer using")[0].strip()
+    return query
+
 
 def _is_good(text: str) -> bool:
     return bool(text) and "not found" not in text.lower() and len(text.strip()) >= MIN_ANSWER
@@ -94,12 +101,16 @@ async def run_qa_system(
 
     key   = _cache_key(query, chat_id)
     entry = _answer_cache.get(key)
+    
     if entry and time.time() - entry[1] < _CACHE_TTL:
         logger.info("[QA] cache hit")
-        return {**entry[0], "cached": True}
+        cached_result = entry[0].copy()
+        cached_result["answer"] = _fix_formatting(cached_result["answer"])
+        return {**cached_result, "cached": True}
 
-    rag_coro = retrieve_documents_async(query, chat_id)
-    web_coro = async_web_search(query) if allow_search else asyncio.sleep(0)
+    clean_query = _extract_question(query)
+    rag_coro = retrieve_documents_async(clean_query, chat_id)
+    web_coro = async_web_search(clean_query) if allow_search else asyncio.sleep(0)
 
     rag_result, web_result = await asyncio.gather(
         _safe(rag_coro, RAG_TIMEOUT, "RAG"),
@@ -121,7 +132,8 @@ async def run_qa_system(
 
     source = "hybrid" if (rag_result and web_result) else ("rag" if rag_result else "web")
     result = {"answer": answer, "source": source, "confidence": 0.85}
-    _answer_cache[key] = (result, time.time())
+    if len(answer) > 100:
+        _answer_cache[key] = (result, time.time())
     return result
 
 
@@ -136,8 +148,9 @@ async def stream_qa(
     Collects full LLM response then yields it as ONE chunk.
     SSE token-by-token streaming strips spaces — single chunk avoids this.
     """
-    rag_coro = retrieve_documents_async(query, chat_id)
-    web_coro = async_web_search(query) if allow_search else asyncio.sleep(0)
+    clean_query = _extract_question(query)
+    rag_coro = retrieve_documents_async(clean_query, chat_id)
+    web_coro = async_web_search(clean_query) if allow_search else asyncio.sleep(0)
 
     rag_result, web_result = await asyncio.gather(
         _safe(rag_coro, RAG_TIMEOUT, "RAG"),
@@ -153,13 +166,12 @@ async def stream_qa(
 
     try:
         if hasattr(llm, "astream"):
-            full = ""
             async for chunk in llm.astream(prompt):
-                full += _extract(chunk)
-            yield _fix_formatting(full)
+                if hasattr(chunk, "content") and chunk.content:
+                    yield chunk.content
         else:
-            raw = await asyncio.to_thread(llm.invoke, prompt)
-            yield _fix_formatting(_extract(raw))
+            result = await asyncio.to_thread(llm.invoke, prompt)
+            yield _extract(result)
     except Exception as e:
         logger.error(f"[QA] stream failed: {e}")
         yield rag_result or "Failed to generate answer."

@@ -12,7 +12,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 
 from src.research_intelligence_system.config.settings import settings
 from src.research_intelligence_system.constants import (
-    CACHE_TTL, CB_FAIL_LIMIT, CB_RESET_TIMEOUT, MIN_RESULT_CHARS
+    CACHE_TTL, CB_FAIL_LIMIT, CB_RESET_TIMEOUT, MIN_RESULT_CHARS, TAVILY_MAX_RESULTS
 )
 from src.research_intelligence_system.utils.logger import get_logger
 
@@ -66,7 +66,7 @@ class _TavilyTool:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = TavilySearchResults(
-                        max_results=settings.TAVILY_MAX_RESULTS
+                        max_results=TAVILY_MAX_RESULTS
                     )
         return cls._instance
 
@@ -77,12 +77,16 @@ def _optimize(query: str) -> str:
     return re.sub(r"\s+", " ", query) + " research paper"
 
 
-def _clean(results: List[dict]) -> str:
+def _clean(results) -> str:
+    if isinstance(results, str):
+        return results
+    if not isinstance(results, list):
+        return ""
     texts = [
         r["content"].strip() for r in results
-        if len(r.get("content", "").strip()) >= MIN_RESULT_CHARS
+        if isinstance(r, dict) and len(r.get("content", "").strip()) >= MIN_RESULT_CHARS
     ]
-    return "\n\n".join(texts[: settings.TAVILY_MAX_RESULTS])
+    return "\n\n".join(texts[: TAVILY_MAX_RESULTS])
 
 
 def _cache_key(query: str) -> str:
