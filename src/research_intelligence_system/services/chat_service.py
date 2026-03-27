@@ -15,6 +15,8 @@ from src.research_intelligence_system.database.chat_repository import (
 from src.research_intelligence_system.services.redis_service import (
     clear_memory, get_memory, push_message
 )
+from src.research_intelligence_system.rag.vector_store import async_delete_by_chat
+
 from src.research_intelligence_system.utils.logger import get_logger
 
 from src.research_intelligence_system.core.qa_system import _fix_formatting
@@ -138,8 +140,14 @@ async def load_chat_history(chat_id: str, db: AsyncSession) -> List[dict]:
 
 
 async def delete_chat_session(chat_id: str) -> None:
-    """Clear Redis memory + QA cache for a chat."""
+    from src.research_intelligence_system.rag.vector_store import async_delete_by_chat
+    import shutil, os
     await asyncio.gather(
         clear_memory(chat_id),
         asyncio.to_thread(invalidate_qa_cache, chat_id),
+        async_delete_by_chat(chat_id),   # delete from Qdrant
     )
+    # delete PDF files from disk
+    chat_dir = os.path.join("artifacts/data", chat_id)
+    if os.path.exists(chat_dir):
+        shutil.rmtree(chat_dir)

@@ -151,3 +151,30 @@ Celery for PDF ingestion
 Structured JSON logging
 Prometheus metrics
 ```
+
+```
+  Domain Classification      BERT Classifier
+  Named Entity Recognition   Fine-tuned SciBERT
+  Citation Classification    Transformer Encoder
+```
+An AI "improvement agent" for research papers is an autonomous, goal-driven system designed to analyze scientific literature, identify gaps, and propose enhancements or future directions. These agents serve as advanced research assistants, surpassing simple summarization by reasoning about limitations in methodology, data, and conclusions. 
+LeewayHertz
+LeewayHertz
+ +1
+Top AI Agents & Tools for Identifying Improvements
+SciSpace Agent: A "super agent" that functions as a lab assistant. It can read, summarize, and identify research gaps in PDFs, as well as suggest methodological advancements.
+Undermine AI: Specializes in identifying research gaps by digesting papers and navigating citation networks to find what is missing or unexplored.
+ResearchRabbit: Visualizes citation networks to identify clusters of well-developed work versus isolated studies, helping users spot gaps and under-explored areas.
+Scite.ai: Analyzes citation context to classify papers as supporting, contradicting, or mentioning, allowing researchers to find weaknesses in a paper by seeing who has contradicted it.
+NotebookLM (Google): Enables users to upload specific research papers and ask for improvements, key gaps, or limitations restricted to those sources. 
+SciSpace
+SciSpace
+ +4
+Functions of an Improvement Agent
+Gap Identification: Scans literature to identify thematic trends, missing data, or under-studied populations.
+Methodological Review: Proposes better methodologies, tools, or measurement techniques to enhance experimental rigor.
+Code & Implementation Setup: Some agents can locate existing code related to a paper (e.g., on GitHub) and configure the environment to test or improve the model.
+Draft Refinement: Provides feedback to improve clarity, strengthen arguments, and update citations. 
+SciSpace
+SciSpace
+ +9

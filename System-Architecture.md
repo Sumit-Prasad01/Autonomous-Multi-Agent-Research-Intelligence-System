@@ -10,7 +10,7 @@ The Autonomous Multi-Agent Research Intelligence System is an advanced
 AI platform designed to: - Ingest research papers (PDF) - Extract
 structured scientific information - Generate summaries - Compare
 multiple papers - Build knowledge graphs - Produce literature reviews -
-Perform self-reflection for quality improvement
+Perform self-reflection for quality improvement - Tells how to implement that research paper
 
 The system integrates: - Generative AI - Agentic AI - Deep Learning -
 NLP - Retrieval-Augmented Generation (RAG) - Knowledge Graph reasoning
@@ -39,7 +39,7 @@ Storage & Knowledge Layer
 
 ### Technologies
 
--   Streamlit / Next.js
+-   Streamlit
 -   Graph visualization (PyVis / Neo4j Bloom)
 
 ### Features
@@ -59,7 +59,7 @@ Storage & Knowledge Layer
 ### Technologies
 
 -   FastAPI
--   LangGraph / CrewAI (Agent orchestration)
+-   LangGraph (Agent orchestration)
 -   Redis (State management)
 
 ### Responsibilities
@@ -75,6 +75,8 @@ Storage & Knowledge Layer
 ## 3.3 Multi-Agent Intelligence Layer
 
 This is the core reasoning layer of the system.
+
+## There Will be main agent that will controll all the agents.
 
 ### 1. Paper Parsing Agent
 
@@ -120,6 +122,13 @@ Strengths - Limitations
 -   Identifies research gaps
 -   Suggests future directions
 
+### 7. Implementation Planner Agent
+-   Gives structured output 
+-   Gives Plan to how to implement that research paper
+
+### 8. Improvement Agent
+- Gives suggestions that how the reseach can be improved
+
 ------------------------------------------------------------------------
 
 ## 3.4 Retrieval + Deep Learning Layer
@@ -129,18 +138,16 @@ Strengths - Limitations
 Flow: Paper → Chunking → Embedding → Vector DB\
 User Query → Embedding → Similarity Search → Context → LLM
 
-Embedding Models: - BGE-large-en - E5-large - Instructor-XL
+Embedding Models: - All mini lm
 
-Vector Database: - FAISS / Qdrant
+Vector Database: -  Qdrant
 
 ### 3.4.2 Trained Deep Learning Models
 
   Component                  Model
   -------------------------- ---------------------
   Summarization              Fine-tuned T5
-  Domain Classification      BERT Classifier
-  Named Entity Recognition   Fine-tuned SciBERT
-  Citation Classification    Transformer Encoder
+
 
 ### 3.4.3 Knowledge Graph Builder
 
@@ -160,9 +167,9 @@ Enables: - Query-based reasoning - Concept exploration - Visualization
 ### Components
 
 -   PostgreSQL → Structured metadata
--   FAISS/Qdrant → Embeddings
+-   Qdrant → Embeddings
 -   Neo4j → Knowledge Graph
--   Local Storage / S3 → PDFs
+-   Local Storage -> PDFs
 
 ------------------------------------------------------------------------
 
@@ -175,6 +182,7 @@ Enables: - Query-based reasoning - Concept exploration - Visualization
 3.  Extraction Agent identifies structured entities
 4.  Summarizer Agent generates summary
 5.  Critic Agent refines summary
+7. Implementation Agents gives plan for how to implement the paper
 6.  Data stored in:
     -   PostgreSQL (metadata)
     -   Vector DB (embeddings)
