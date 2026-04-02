@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from typing import Dict
+from typing import Dict, List
 
 import aiofiles
 from fastapi import (APIRouter, Depends, HTTPException, UploadFile, File)
@@ -20,7 +20,12 @@ from src.research_intelligence_system.database.chat_repository import (
     create_chat, delete_chat, get_chat, get_user_chats, update_chat_title
 )
 from src.research_intelligence_system.database.database import get_db, check_db_health
-from src.research_intelligence_system.pipeline.paper_processing_pipeline import ingest_pdf
+from src.research_intelligence_system.database.paper_repository import (
+    get_paper_analyses, get_paper_analysis
+)
+from src.research_intelligence_system.pipeline.paper_processing_pipeline import (
+    ingest_pdf, ingest_multiple
+)
 from src.research_intelligence_system.rag.retriever import invalidate_retriever_cache
 from src.research_intelligence_system.services.auth_service import (
     decode_token, login_user, logout_user, register_user
@@ -37,7 +42,9 @@ logger   = get_logger(__name__)
 router   = APIRouter(prefix="/api/v1", tags=["api"])
 security = HTTPBearer()
 
-_ingest_status: Dict[str, Dict] = {}
+# ── In-memory status stores ───────────────────────────────────────────────────
+_ingest_status:   Dict[str, Dict] = {}   # chat_id → {status, paper_ids, error}
+_analysis_status: Dict[str, Dict] = {}   # chat_id → {status, error}
 
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
@@ -194,7 +201,6 @@ async def stream_message(
                 db=db,
             ):
                 if token:
-                    # encode spaces so SSE doesn't strip them
                     yield f"data: {token.replace(' ', chr(160))}\n\n"
         except Exception as e:
             yield f"data: [ERROR] {e}\n\n"
@@ -204,15 +210,28 @@ async def stream_message(
 
 
 # ── PDF upload ────────────────────────────────────────────────────────────────
-async def _run_ingest(chat_id: str, file_path: str):
-    _ingest_status[chat_id] = {"status": "processing", "error": None}
+async def _run_ingest(chat_id: str, file_paths: List[str]):
+    """
+    Ingest one or more PDFs.
+    Creates PaperAnalysis rows with status=pending.
+    Stores paper_ids in _ingest_status for analysis trigger.
+    """
+    from src.research_intelligence_system.database.database import AsyncSessionLocal
+
+    _ingest_status[chat_id] = {"status": "processing", "paper_ids": [], "error": None}
     try:
-        logger.info(f"[INGEST] starting chat_id={chat_id}")
-        await ingest_pdf(chat_id=chat_id, pdf_path=file_path)
-        _ingest_status[chat_id] = {"status": "ready", "error": None}
-        logger.info(f"[INGEST] ready chat_id={chat_id}")
+        logger.info(f"[INGEST] starting chat_id={chat_id} files={len(file_paths)}")
+        async with AsyncSessionLocal() as db:
+            paper_ids = await ingest_multiple(chat_id, file_paths, db=db)
+
+        _ingest_status[chat_id] = {
+            "status":    "ready",
+            "paper_ids": paper_ids,
+            "error":     None,
+        }
+        logger.info(f"[INGEST] ready chat_id={chat_id} paper_ids={paper_ids}")
     except Exception as e:
-        _ingest_status[chat_id] = {"status": "failed", "error": str(e)}
+        _ingest_status[chat_id] = {"status": "failed", "paper_ids": [], "error": str(e)}
         logger.error(f"[INGEST] failed: {e}", exc_info=True)
 
 
@@ -241,7 +260,12 @@ async def upload_pdf(
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(content)
 
-    asyncio.get_event_loop().create_task(_run_ingest(chat_id, file_path))
+    # accumulate file paths if multiple uploads in same chat
+    existing = _ingest_status.get(chat_id, {}).get("pending_paths", [])
+    existing.append(file_path)
+    _ingest_status[chat_id] = {"status": "queued", "pending_paths": existing, "paper_ids": [], "error": None}
+
+    asyncio.get_event_loop().create_task(_run_ingest(chat_id, existing))
     return {"status": "processing", "filename": safe_name}
 
 
@@ -250,7 +274,106 @@ async def ingest_status(
     chat_id: str,
     user: dict = Depends(get_current_user),
 ):
-    return _ingest_status.get(chat_id, {"status": "unknown", "error": None})
+    return _ingest_status.get(chat_id, {"status": "unknown", "paper_ids": [], "error": None})
+
+
+# ── Analysis (orchestrator trigger) ──────────────────────────────────────────
+async def _run_analysis(chat_id: str, paper_ids: List[str], llm_id: str):
+    """Run full multi-agent analysis on uploaded papers."""
+    from src.research_intelligence_system.database.database import AsyncSessionLocal
+    from src.research_intelligence_system.agents.orchestrator_agent import OrchestratorAgent
+
+    _analysis_status[chat_id] = {"status": "running", "error": None}
+    try:
+        logger.info(f"[ANALYSIS] starting chat_id={chat_id} papers={paper_ids}")
+        async with AsyncSessionLocal() as db:
+            orchestrator = OrchestratorAgent(llm_id=llm_id)
+            await orchestrator.run_full_analysis(
+                chat_id=chat_id,
+                paper_ids=paper_ids,
+                db=db,
+            )
+        _analysis_status[chat_id] = {"status": "complete", "error": None}
+        logger.info(f"[ANALYSIS] complete chat_id={chat_id}")
+    except Exception as e:
+        _analysis_status[chat_id] = {"status": "failed", "error": str(e)}
+        logger.error(f"[ANALYSIS] failed: {e}", exc_info=True)
+
+
+@router.post("/chats/{chat_id}/analyze")
+async def trigger_analysis(
+    chat_id: str,
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Triggered when user clicks 'Get Analysis' button.
+    Runs orchestrator → all agents → saves results.
+    """
+    chat = await get_chat(db, chat_id, user["sub"])
+    if not chat:
+        raise HTTPException(404, "Chat not found.")
+
+    status = _ingest_status.get(chat_id, {})
+    if status.get("status") != "ready":
+        raise HTTPException(400, "Papers not ready. Upload and wait for ingestion to complete.")
+
+    paper_ids = status.get("paper_ids", [])
+    if not paper_ids:
+        # try fetching from Postgres if server restarted
+        analyses = await get_paper_analyses(db, chat_id)
+        paper_ids = [str(a.id) for a in analyses]
+
+    if not paper_ids:
+        raise HTTPException(400, "No papers found for this chat.")
+
+    asyncio.get_event_loop().create_task(
+        _run_analysis(chat_id, paper_ids, chat.llm_id)
+    )
+    return {"status": "running", "paper_count": len(paper_ids)}
+
+
+@router.get("/chats/{chat_id}/analysis-status")
+async def analysis_status(
+    chat_id: str,
+    user: dict = Depends(get_current_user),
+):
+    return _analysis_status.get(chat_id, {"status": "not_started", "error": None})
+
+
+@router.get("/chats/{chat_id}/analysis")
+async def get_analysis(
+    chat_id: str,
+    user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all agent outputs for this chat."""
+    chat = await get_chat(db, chat_id, user["sub"])
+    if not chat:
+        raise HTTPException(404, "Chat not found.")
+
+    analyses = await get_paper_analyses(db, chat_id)
+    if not analyses:
+        raise HTTPException(404, "No analysis found. Run 'Get Analysis' first.")
+
+    return {
+        "papers": [
+            {
+                "paper_id":          str(a.id),
+                "filename":          a.filename,
+                "status":            a.analysis_status,
+                "entities":          a.entities,
+                "summaries":         a.summaries,
+                "refined_summary":   a.refined_summary,
+                "quality_score":     a.quality_score,
+                "research_gaps":     a.research_gaps,
+                "future_directions": a.future_directions,
+                "triples":           a.triples,
+                "similar_papers":    a.similar_papers,
+            }
+            for a in analyses
+        ]
+    }
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

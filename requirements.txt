@@ -42,3 +42,4 @@ passlib[bcrypt]
 python-jose[cryptography] 
 python-multipart
 neo4j
+arxiv
