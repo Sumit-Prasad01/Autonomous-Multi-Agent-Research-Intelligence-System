@@ -1,7 +1,17 @@
+"""
+paper_processing_pipeline.py
+Stage 1+2: PDF ingestion → chunks → Qdrant
+Also creates PaperAnalysis rows in Postgres (status=pending)
+Full agent analysis triggered separately via orchestrator
+"""
 from __future__ import annotations
 
 import asyncio
-from typing import List
+import hashlib
+import os
+from typing import List, Optional
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.research_intelligence_system.rag.pdf_parser import parse_pdf
 from src.research_intelligence_system.rag.retriever import invalidate_retriever_cache
@@ -21,41 +31,106 @@ def _batch(lst, n):
         yield lst[i: i + n]
 
 
-async def ingest_pdf(chat_id: str, pdf_path: str) -> bool:
+def _compute_file_hash(pdf_path: str) -> str:
+    h = hashlib.md5()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def ingest_pdf(
+    chat_id: str,
+    pdf_path: str,
+    db: Optional[AsyncSession] = None,
+) -> str:
+    """
+    Stage 1+2: Parse PDF → embed → store in Qdrant.
+    Creates a PaperAnalysis row in Postgres with status=pending.
+    Returns paper_id (UUID string).
+    """
     try:
         logger.info(f"[INGEST] chat_id={chat_id} path={pdf_path}")
 
+        # ── parse + chunk ─────────────────────────────────────────────────────
         chunks = await parse_pdf(pdf_path, chat_id=chat_id)
         if not chunks:
             raise CustomException("No chunks produced from PDF.")
 
         logger.info(f"[INGEST] {len(chunks)} chunks → storing …")
 
-        # parallel batch writes
+        # ── store in Qdrant ───────────────────────────────────────────────────
         await asyncio.gather(*[
             async_add_documents(batch, chat_id)
             for batch in _batch(chunks, BATCH_SIZE)
         ])
 
-        # bust all caches for this chat
         invalidate_retriever_cache(chat_id)
         invalidate_search_cache(chat_id)
 
-        logger.info(f"[INGEST] done chat_id={chat_id}")
-        return True
+        # ── create PaperAnalysis row in Postgres ──────────────────────────────
+        paper_id = None
+        if db is not None:
+            paper_id = await _create_paper_analysis(
+                db=db,
+                chat_id=chat_id,
+                pdf_path=pdf_path,
+            )
+
+        logger.info(f"[INGEST] done chat_id={chat_id} paper_id={paper_id}")
+        return paper_id or ""
 
     except Exception as e:
         logger.exception("[INGEST] failed")
         raise CustomException("PDF ingestion failed.", e)
 
 
-async def ingest_multiple(chat_id: str, pdf_paths: List[str]) -> List[bool]:
-    """Ingest multiple PDFs concurrently."""
+async def _create_paper_analysis(
+    db: AsyncSession,
+    chat_id: str,
+    pdf_path: str,
+) -> str:
+    """Create a pending PaperAnalysis row and return its UUID."""
+    import uuid as uuid_lib
+    from src.research_intelligence_system.database.models import PaperAnalysis
+
+    file_hash = await asyncio.get_running_loop().run_in_executor(
+        None, _compute_file_hash, pdf_path
+    )
+    filename = os.path.basename(pdf_path)
+
+    paper = PaperAnalysis(
+        id=uuid_lib.uuid4(),
+        chat_id=uuid_lib.UUID(chat_id),
+        filename=filename,
+        file_hash=file_hash,
+        analysis_status="pending",
+    )
+    db.add(paper)
+    await db.commit()
+    await db.refresh(paper)
+    logger.info(f"[INGEST] PaperAnalysis created id={paper.id} status=pending")
+    return str(paper.id)
+
+
+async def ingest_multiple(
+    chat_id: str,
+    pdf_paths: List[str],
+    db: Optional[AsyncSession] = None,
+) -> List[str]:
+    """
+    Ingest multiple PDFs concurrently.
+    Returns list of paper_ids.
+    """
     results = await asyncio.gather(
-        *[ingest_pdf(chat_id, p) for p in pdf_paths],
+        *[ingest_pdf(chat_id, p, db=db) for p in pdf_paths],
         return_exceptions=True,
     )
+    paper_ids = []
     for i, r in enumerate(results):
         if isinstance(r, Exception):
             logger.error(f"[INGEST] failed for {pdf_paths[i]}: {r}")
-    return [not isinstance(r, Exception) for r in results]
+            paper_ids.append("")
+        else:
+            paper_ids.append(r)
+    return paper_ids
