@@ -130,3 +130,7 @@ async def async_web_search(query: str) -> str:
 def clear_search_cache() -> None:
     with _cache_lock:
         _cache.clear()
+
+def sync_web_search(query: str) -> str:
+    """Sync wrapper for use in non-async contexts (comparison_agent)."""
+    return run_web_search(query)

@@ -1,3 +1,7 @@
+"""
+retriever.py — Hybrid GraphRAG retriever
+Combines: Dense (Qdrant) + BM25 + RRF fusion + Reranker + Neo4j subgraph
+"""
 from __future__ import annotations
 
 import asyncio
@@ -33,7 +37,7 @@ _SECTION_HINTS: Dict[str, str] = {
 }
 
 
-# ── Per-chat BM25 cache ───────────────────────────────────────────────────────
+# ── BM25 cache ────────────────────────────────────────────────────────────────
 class _BM25Cache:
     def __init__(self):
         self._cache: Dict[str, Tuple[BM25Retriever, float]] = {}
@@ -56,7 +60,6 @@ _bm25_cache = _BM25Cache()
 
 
 def _build_bm25(chat_id: str) -> BM25Retriever:
-    """Fetch docs from Qdrant scroll API — works with QdrantVectorStore."""
     from qdrant_client.models import Filter, FieldCondition, MatchValue
 
     results, _ = _store.client.scroll(
@@ -69,15 +72,10 @@ def _build_bm25(chat_id: str) -> BM25Retriever:
         with_payload=True,
         with_vectors=False,
     )
-    if results:
-        logger.info(f"[BM25 DEBUG] first point payload: {results[0].payload}")
-    else:
-        logger.warning(f"[BM25 DEBUG] no points found for chat_id={chat_id}")
 
     docs = []
     for point in results:
         payload = point.payload or {}
-        # LangChain QdrantVectorStore stores content under "page_content" key
         content  = payload.get("page_content", "")
         metadata = payload.get("metadata", {})
         if content:
@@ -131,47 +129,115 @@ def _infer_section(query: str) -> Optional[str]:
     return None
 
 
-# ── Core ──────────────────────────────────────────────────────────────────────
-async def _hybrid_fetch(query: str, chat_id: str,
-                        section: Optional[str]) -> List[Document]:
+# ── GraphRAG: Neo4j subgraph context ─────────────────────────────────────────
+def _extract_query_entities(query: str) -> List[str]:
+    """
+    Extract potential entity names from query for Neo4j lookup.
+    Simple heuristic: capitalized words + known keywords.
+    """
+    words   = query.split()
+    # capitalized words likely to be entity names
+    entities = [w.strip("?.,!:;") for w in words if w and w[0].isupper()]
+    # also add 2-word combos (e.g. "BERT model", "ImageNet dataset")
+    for i in range(len(words) - 1):
+        combo = f"{words[i]} {words[i+1]}"
+        if words[i][0].isupper():
+            entities.append(combo.strip("?.,!:;"))
+    return list(set(entities))[:10]
+
+
+def _get_graph_context(chat_id: str, query: str) -> str:
+    """
+    Query Neo4j for subgraph around query entities.
+    Returns natural language representation of graph context.
+    """
+    try:
+        from src.research_intelligence_system.knowledge_graph.neo4j_service import Neo4jService
+        neo4j    = Neo4jService()
+        entities = _extract_query_entities(query)
+        if not entities:
+            return ""
+        context = neo4j.get_subgraph_text(chat_id, entities)
+        if context:
+            logger.info(f"[GRAPHRAG] got {len(context.splitlines())} triples from Neo4j")
+        return context
+    except Exception as e:
+        logger.debug(f"[GRAPHRAG] Neo4j context failed (non-fatal): {e}")
+        return ""
+
+
+# ── Core hybrid fetch ─────────────────────────────────────────────────────────
+async def _hybrid_fetch(
+    query:   str,
+    chat_id: str,
+    section: Optional[str],
+) -> Tuple[List[Document], str]:
+    """
+    Run dense + BM25 + Neo4j in parallel.
+    Returns (fused_docs, graph_context).
+    """
     loop = asyncio.get_running_loop()
 
-    # run dense + BM25 in parallel
+    # dense + BM25 + graph — all three in parallel
     try:
         bm25_obj = await _get_bm25(chat_id)
+
         dense_task = async_search_with_score(query, k=DENSE_FETCH_K, chat_id=chat_id)
         bm25_task  = loop.run_in_executor(_POOL, bm25_obj.invoke, query)
-        dense_results, bm25_results = await asyncio.gather(dense_task, bm25_task)
+        graph_task = loop.run_in_executor(_POOL, _get_graph_context, chat_id, query)
+
+        dense_results, bm25_results, graph_context = await asyncio.gather(
+            dense_task, bm25_task, graph_task
+        )
+
     except CustomException:
-        # BM25 failed (no docs in Qdrant yet) — fall back to dense only
-        logger.warning("[RETRIEVER] BM25 failed — falling back to dense only")
-        dense_results = await async_search_with_score(query, k=DENSE_FETCH_K, chat_id=chat_id)
-        bm25_results  = []
+        logger.warning("[RETRIEVER] BM25 failed — falling back to dense + graph")
+        dense_task = async_search_with_score(query, k=DENSE_FETCH_K, chat_id=chat_id)
+        graph_task = loop.run_in_executor(_POOL, _get_graph_context, chat_id, query)
+        dense_results, graph_context = await asyncio.gather(dense_task, graph_task)
+        bm25_results = []
 
-    logger.info(f"[RETRIEVER] dense={len(dense_results)} bm25={len(bm25_results)} section={section}")
-    return _rrf_fuse(dense_results, bm25_results)
+    logger.info(
+        f"[RETRIEVER] dense={len(dense_results)} "
+        f"bm25={len(bm25_results)} "
+        f"graph_triples={len(graph_context.splitlines()) if graph_context else 0} "
+        f"section={section}"
+    )
+
+    fused = _rrf_fuse(dense_results, bm25_results)
+    return fused, graph_context or ""
 
 
+# ── Public async API ──────────────────────────────────────────────────────────
 async def retrieve_documents_async(
-    query: str,
+    query:   str,
     chat_id: str,
-    top_k: int = FINAL_TOP_K,
+    top_k:   int = FINAL_TOP_K,
 ) -> str:
     logger.info(f"[RETRIEVER] query={query!r} chat_id={chat_id}")
 
     section = _infer_section(query)
-    fused   = await _hybrid_fetch(query, chat_id, section)
+    fused, graph_context = await _hybrid_fetch(query, chat_id, section)
 
-    if not fused:
+    if not fused and not graph_context:
         logger.warning("[RETRIEVER] no documents found")
         return ""
 
-    loop   = asyncio.get_running_loop()
-    texts  = [d.page_content for d in fused]
-    ranked = await loop.run_in_executor(_POOL, rerank_documents, query, texts, top_k)
+    # rerank vector results
+    loop    = asyncio.get_running_loop()
+    texts   = [d.page_content for d in fused]
+    ranked  = await loop.run_in_executor(_POOL, rerank_documents, query, texts, top_k)
 
     logger.info(f"[RETRIEVER] {len(ranked)} chunks after rerank")
-    return "\n\n".join(ranked)
+
+    # build final context — vector chunks + graph context
+    parts = []
+    if ranked:
+        parts.append("### Retrieved Chunks\n" + "\n\n".join(ranked))
+    if graph_context:
+        parts.append("### Knowledge Graph Context\n" + graph_context)
+
+    return "\n\n".join(parts)
 
 
 # ── Sync shim ─────────────────────────────────────────────────────────────────

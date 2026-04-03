@@ -21,13 +21,15 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.badge{font-size:0.78rem;color:#888;margin-bottom:6px}
 @keyframes thinking-dot{0%,80%,100%{transform:scale(.6);opacity:.4}40%{transform:scale(1);opacity:1}}
 .thinking-wrap{display:flex;align-items:center;gap:8px;padding:6px 0;color:#888;font-size:.95rem;font-style:italic}
 .thinking-dots{display:flex;gap:4px}
 .thinking-dots span{display:inline-block;width:7px;height:7px;border-radius:50%;background:#888;animation:thinking-dot 1.2s infinite ease-in-out}
 .thinking-dots span:nth-child(2){animation-delay:.2s}
 .thinking-dots span:nth-child(3){animation-delay:.4s}
+.entity-tag{display:inline-block;background:#1d3a5f;color:#60a5fa;padding:2px 8px;border-radius:12px;font-size:0.8rem;margin:2px}
+.gap-item{border-left:3px solid #7c3aed;padding:6px 10px;margin:4px 0;border-radius:0 4px 4px 0;background:#1a1a2e}
+.analysis-banner{background:#0f3460;border-radius:8px;padding:12px 16px;margin:8px 0;border:1px solid #1a5276}
 </style>
 """, unsafe_allow_html=True)
 
@@ -39,9 +41,8 @@ THINKING_HTML = """
 """
 
 
-# ── Session helpers ───────────────────────────────────────────────────────────
-def _restore_session_from_server(session_id: str) -> bool:
-    """Call backend to get token from session_id stored in Redis."""
+# ── Session init ──────────────────────────────────────────────────────────────
+def _restore_session(session_id: str) -> bool:
     try:
         r = requests.get(f"{BACKEND}/auth/session/{session_id}", timeout=5)
         if r.status_code == 200:
@@ -54,7 +55,6 @@ def _restore_session_from_server(session_id: str) -> bool:
     return False
 
 
-# ── Session init ──────────────────────────────────────────────────────────────
 def _init():
     for k, v in {
         "token":           None,
@@ -63,14 +63,14 @@ def _init():
         "chats":           {},
         "llm_id":          LLM_OPTIONS[0],
         "allow_search":    False,
+        "analysis_cache":  {},   # cid → analysis data
     }.items():
         st.session_state.setdefault(k, v)
 
-    # restore session from Redis via session_id in query params
     if not st.session_state.token:
         sid = st.query_params.get("sid")
         if sid:
-            _restore_session_from_server(sid)
+            _restore_session(sid)
 
 _init()
 
@@ -92,7 +92,7 @@ def _api(method: str, path: str, show_error: bool = True, **kw):
         return None
 
 
-# ── Auth page ─────────────────────────────────────────────────────────────────
+# ── Auth ──────────────────────────────────────────────────────────────────────
 def _login_page():
     st.title("🔬 Research AI")
     tab_login, tab_reg = st.tabs(["Login", "Register"])
@@ -101,15 +101,12 @@ def _login_page():
         email    = st.text_input("Email", key="login_email")
         password = st.text_input("Password", type="password", key="login_pass")
         if st.button("Login", type="primary", use_container_width=True):
-            r = requests.post(
-                f"{BACKEND}/auth/login",
-                json={"email": email, "password": password}, timeout=10,
-            )
+            r = requests.post(f"{BACKEND}/auth/login",
+                              json={"email": email, "password": password}, timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 st.session_state.token = data["access_token"]
                 st.session_state.user  = email
-                # store only session_id in URL — token stays in Redis
                 st.query_params["sid"] = data["session_id"]
                 st.rerun()
             else:
@@ -120,11 +117,9 @@ def _login_page():
         r_username = st.text_input("Username", key="reg_user")
         r_password = st.text_input("Password", type="password", key="reg_pass")
         if st.button("Register", type="primary", use_container_width=True):
-            r = requests.post(
-                f"{BACKEND}/auth/register",
-                json={"email": r_email, "username": r_username, "password": r_password},
-                timeout=10,
-            )
+            r = requests.post(f"{BACKEND}/auth/register",
+                              json={"email": r_email, "username": r_username,
+                                    "password": r_password}, timeout=10)
             if r.status_code == 201:
                 st.success("Registered! Please login.")
             else:
@@ -142,10 +137,10 @@ def _load_chats():
                     "title":    c["title"],
                     "messages": [],
                     "ready":    False,
+                    "analyzed": False,
                     "llm_id":   c["llm_id"],
                 }
             else:
-                # only sync if backend title is not default
                 if c["title"] != "New Chat":
                     st.session_state.chats[cid]["title"] = c["title"]
 
@@ -161,7 +156,7 @@ def _new_chat():
         cid  = data["id"]
         st.session_state.chats[cid] = {
             "title": data["title"], "messages": [],
-            "ready": False, "llm_id": data["llm_id"],
+            "ready": False, "analyzed": False, "llm_id": data["llm_id"],
         }
         st.session_state.current_chat_id = cid
         st.rerun()
@@ -170,6 +165,7 @@ def _new_chat():
 def _delete_chat(cid: str):
     _api("delete", f"/chats/{cid}")
     st.session_state.chats.pop(cid, None)
+    st.session_state.analysis_cache.pop(cid, None)
     if st.session_state.current_chat_id == cid:
         st.session_state.current_chat_id = None
     st.rerun()
@@ -186,14 +182,14 @@ def _switch_chat(cid: str):
     st.rerun()
 
 
-# ── Upload ────────────────────────────────────────────────────────────────────
+# ── Upload & poll ─────────────────────────────────────────────────────────────
 def _upload(cid: str, file) -> bool:
     r = _api("post", f"/chats/{cid}/upload",
              files={"file": (file.name, file.getvalue(), "application/pdf")})
     return r is not None and r.status_code == 200
 
 
-def _poll_status(cid: str) -> str:
+def _poll_ingest(cid: str) -> str:
     bar = st.progress(0, text="⏳ Processing …")
     i   = 0
     while True:
@@ -213,14 +209,162 @@ def _poll_status(cid: str) -> str:
             bar.empty()
             return "failed"
         if i >= MAX_POLLS:
-            bar.progress(95, text="⏳ Still processing … please wait")
+            bar.progress(95, text="⏳ Still processing …")
             if i > MAX_POLLS * 3:
                 bar.empty()
                 return "timeout"
 
 
+def _trigger_analysis(cid: str) -> bool:
+    """Trigger orchestrator and poll until complete."""
+    r = _api("post", f"/chats/{cid}/analyze", show_error=True)
+    if not r or r.status_code != 200:
+        st.error("Failed to start analysis.")
+        return False
+
+    bar = st.progress(0, text="🤖 Running agents …")
+    i   = 0
+    while True:
+        time.sleep(3)
+        try:
+            r = _api("get", f"/chats/{cid}/analysis-status", show_error=False)
+            s = r.json().get("status", "unknown") if r else "unknown"
+        except Exception:
+            s = "unknown"
+        i += 1
+        pct = min(int(i / 30 * 100), 95)
+        bar.progress(pct, text=f"🤖 {s} … ({i * 3}s)")
+        if s == "complete":
+            bar.progress(100, text="✅ Analysis complete!")
+            return True
+        if s == "failed":
+            bar.empty()
+            st.error(f"Analysis failed.")
+            return False
+        if i > 80:   # 4 min cap
+            bar.empty()
+            st.warning("Analysis is taking long — check back in a moment.")
+            return False
+
+
+def _fetch_analysis(cid: str) -> Optional[Dict]:
+    """Fetch analysis results from backend."""
+    r = _api("get", f"/chats/{cid}/analysis", show_error=False)
+    if r and r.status_code == 200:
+        return r.json()
+    return None
+
+
+# ── Analysis renderers (inline, collapsible) ──────────────────────────────────
+def _render_analysis(analysis: Dict):
+    papers = analysis.get("papers", [])
+    if not papers:
+        return
+
+    for paper in papers:
+        fname    = paper.get("filename", "Paper")
+        entities = paper.get("entities", {})
+        summary  = paper.get("refined_summary", "")
+        summaries= paper.get("summaries", {})
+        gaps     = paper.get("research_gaps", [])
+        dirs     = paper.get("future_directions", [])
+        score    = paper.get("quality_score", 0)
+
+        st.markdown(f"---\n### 📄 {fname}")
+        col1, col2 = st.columns([4, 1])
+        with col2:
+            st.metric("Quality", f"{score:.1f}/10")
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        with st.expander("📋 Summary", expanded=True):
+            if summary:
+                st.markdown(summary)
+            if summaries:
+                for section, text in summaries.items():
+                    if text and section != "overall":
+                        st.markdown(f"**{section.title()}:** {text}")
+
+        # ── Entities ──────────────────────────────────────────────────────────
+        with st.expander("🔬 Entities"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown("**🤖 Models**")
+                for m in entities.get("models", []):
+                    st.markdown(f'<span class="entity-tag">{m}</span>',
+                                unsafe_allow_html=True)
+            with c2:
+                st.markdown("**📊 Datasets**")
+                for d in entities.get("datasets", []):
+                    st.markdown(f'<span class="entity-tag">{d}</span>',
+                                unsafe_allow_html=True)
+            with c3:
+                st.markdown("**📏 Metrics**")
+                for me in entities.get("metrics", []):
+                    st.markdown(f'<span class="entity-tag">{me}</span>',
+                                unsafe_allow_html=True)
+            if entities.get("methods"):
+                st.markdown("**🔧 Methods**")
+                for method in entities.get("methods", []):
+                    st.markdown(f'<span class="entity-tag">{method}</span>',
+                                unsafe_allow_html=True)
+
+        # ── Research Gaps ─────────────────────────────────────────────────────
+        with st.expander("🔍 Research Gaps & Future Directions"):
+            if gaps:
+                st.markdown("**Research Gaps:**")
+                for gap in gaps:
+                    st.markdown(f'<div class="gap-item">🔹 {gap}</div>',
+                                unsafe_allow_html=True)
+            else:
+                st.info("No gaps detected yet.")
+            if dirs:
+                st.markdown("**Future Directions:**")
+                for d in dirs:
+                    st.markdown(f"- {d}")
+
+        # ── Similar Papers ────────────────────────────────────────────────────
+        similar = paper.get("similar_papers", [])
+        if similar:
+            with st.expander("🔗 Similar Papers (arXiv)"):
+                for p in similar[:5]:
+                    st.markdown(
+                        f"**{p.get('title', 'Unknown')}** ({p.get('year', '')})\n\n"
+                        f"{p.get('abstract', '')[:200]}…\n\n"
+                        f"[View on arXiv]({p.get('url', '#')})"
+                    )
+                    st.divider()
+
+    # ── Comparison (cross-paper) ──────────────────────────────────────────────
+    comp = analysis.get("comparison", {})
+    if comp:
+        with st.expander("📊 Comparison"):
+            if comp.get("positioning"):
+                st.markdown(f"**Positioning:** {comp['positioning']}")
+            if comp.get("evolution_trends"):
+                st.markdown(f"**Evolution:** {comp['evolution_trends']}")
+            table = comp.get("comparison_table", {})
+            if table and table.get("headers") and table.get("rows"):
+                import pandas as pd
+                df = pd.DataFrame(table["rows"], columns=table["headers"])
+                st.dataframe(df, use_container_width=True)
+            if comp.get("ranking"):
+                st.markdown("**Ranking:** " + " > ".join(comp["ranking"]))
+
+    # ── Literature Review ─────────────────────────────────────────────────────
+    lit = analysis.get("literature_review", {})
+    if lit and lit.get("review_text"):
+        with st.expander("📚 Literature Review"):
+            if lit.get("themes"):
+                st.markdown("**Themes:** " + " · ".join(lit["themes"]))
+            st.markdown(lit["review_text"])
+            if lit.get("research_gaps_summary"):
+                st.markdown(f"**Gaps Summary:** {lit['research_gaps_summary']}")
+            if lit.get("future_directions"):
+                st.markdown(f"**Future Directions:** {lit['future_directions']}")
+
+
 # ── Streaming ─────────────────────────────────────────────────────────────────
-def _fix_streaming_format(text: str) -> str:
+def _fix_format(text: str) -> str:
     import re
     text = re.sub(r'(\S)\s{0,2}(\d+\.\s+\*\*)', r'\1\n\n\2', text)
     text = re.sub(r'(\S)\s{0,2}(\*\*Summary)', r'\1\n\n\2', text)
@@ -245,10 +389,9 @@ def _stream_answer(cid: str, message: str, llm_id: str, allow_search: bool) -> s
                     full = event.data; break
                 full += event.data.replace(chr(160), ' ')
                 placeholder.markdown(full + "▌", unsafe_allow_html=True)
-            full = _fix_streaming_format(full)
+            full = _fix_format(full)
         placeholder.markdown(full, unsafe_allow_html=True)
         return full
-    
     except Exception:
         r      = _api("post", f"/chats/{cid}/message",
                       json={"message": message, "llm_id": llm_id, "allow_search": allow_search})
@@ -257,7 +400,9 @@ def _stream_answer(cid: str, message: str, llm_id: str, allow_search: bool) -> s
         return answer
 
 
-# ── Gate: require login ───────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# MAIN APP
+# ════════════════════════════════════════════════════════════════════════════
 if not st.session_state.token:
     _login_page()
     st.stop()
@@ -270,7 +415,6 @@ with st.sidebar:
     st.caption(f"Logged in as **{st.session_state.user}**")
 
     if st.button("Logout", use_container_width=True):
-        # delete session from Redis
         sid = st.query_params.get("sid")
         if sid:
             requests.delete(f"{BACKEND}/auth/session/{sid}", timeout=5)
@@ -314,7 +458,7 @@ cid  = st.session_state.current_chat_id
 chat = st.session_state.chats[cid]
 st.title(chat["title"])
 
-# ── PDF upload ────────────────────────────────────────────────────────────────
+# ── PDF Upload ────────────────────────────────────────────────────────────────
 with st.expander("📎 Upload PDF(s)", expanded=not chat["ready"]):
     files = st.file_uploader(
         "Drop research papers here", type=["pdf"],
@@ -327,36 +471,64 @@ with st.expander("📎 Upload PDF(s)", expanded=not chat["ready"]):
             if not ok:
                 st.error(f"Upload failed: {f.name}")
                 continue
-            status = _poll_status(cid)
+            status = _poll_ingest(cid)
             if status == "ready":
                 chat["ready"] = True
                 st.success(f"✅ {f.name} indexed!")
-                st.rerun()    # ← rerun immediately so chat input appears
             elif status == "failed":
                 st.error(f"❌ Indexing failed for {f.name}")
             else:
                 chat["ready"] = True
-                st.warning("⏱ Processing may still be running — refreshing …")
-                st.rerun()    # ← rerun on timeout too
+                st.warning("⏱ Still processing — continuing anyway.")
+        st.rerun()
 
 if not chat["ready"]:
     st.info("Upload at least one PDF to start chatting.")
     st.stop()
 
-# ── Chat history ──────────────────────────────────────────────────────────────
+# ── Get Analysis button ───────────────────────────────────────────────────────
+if not chat.get("analyzed"):
+    st.markdown(
+        '<div class="analysis-banner">✅ Paper processed! Click <b>Get Analysis</b> '
+        'to extract entities, summaries, research gaps, and comparison.</div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("🔍 Get Analysis", type="primary", use_container_width=True):
+        with st.spinner("Starting analysis …"):
+            success = _trigger_analysis(cid)
+        if success:
+            chat["analyzed"] = True
+            # fetch and cache analysis
+            data = _fetch_analysis(cid)
+            if data:
+                st.session_state.analysis_cache[cid] = data
+        st.rerun()
+
+# ── Analysis results (inline collapsible) ────────────────────────────────────
+if chat.get("analyzed"):
+    analysis = st.session_state.analysis_cache.get(cid)
+    if not analysis:
+        # try fetching if not in cache (e.g. after page refresh)
+        analysis = _fetch_analysis(cid)
+        if analysis:
+            st.session_state.analysis_cache[cid] = analysis
+
+    if analysis:
+        _render_analysis(analysis)
+
+# ── Chat messages ─────────────────────────────────────────────────────────────
 for msg in chat["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"], unsafe_allow_html=True)
         if msg["role"] == "assistant" and msg.get("source"):
             st.caption(f'📌 {msg["source"]} · 🎯 {msg.get("confidence", "")}')
 
-# ── Input ─────────────────────────────────────────────────────────────────────
+# ── Chat input ────────────────────────────────────────────────────────────────
 user_input = st.chat_input("Ask about your research paper …")
 
 if user_input:
     if not chat["messages"]:
         chat["title"] = user_input[:40]
-        # immediately update sidebar title in session state
         st.session_state.chats[cid]["title"] = user_input[:40]
 
     chat["messages"].append({"role": "user", "content": user_input})

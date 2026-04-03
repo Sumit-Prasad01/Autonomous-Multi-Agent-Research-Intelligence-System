@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     SECRET_KEY : str = os.getenv("SECRET_KEY")
     REDIS_URL : str = os.getenv("REDIS_URL")
     COOKIE_SECRET : str = os.getenv("COOKIE_SECRET")
-
+    NEO4J_URI : str = os.getenv("NEO4J_URI")
+    NEO4J_USER : str = os.getenv("NEO4J_USER")
+    NEO4J_PASSWORD : str = os.getenv("NEO4J_PASSWORD")
 
     class Config:
         env_file = ".env"

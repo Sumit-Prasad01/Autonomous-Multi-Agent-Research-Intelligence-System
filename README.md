@@ -178,3 +178,51 @@ Draft Refinement: Provides feedback to improve clarity, strengthen arguments, an
 SciSpace
 SciSpace
  +9
+
+# Frontend Design
+ ```bash
+ ┌─────────────────────────────────────────────────────────────┐
+│ Sidebar          │ Main Area                                 │
+│                  │                                           │
+│ 🔬 Research AI   │ [Chat Title]                             │
+│ Logged in as ... │                                           │
+│ [Logout]         │ ┌─ Upload PDF(s) expander ─────────────┐  │
+│                  │ │ drag & drop + Upload & Process btn    │ │
+│ Model dropdown   │ └───────────────────────────────────────┘ │
+│ Web Search toggle│                                           │
+│                  │ ✅ Paper ready! [Get Analysis] button     │
+│ [+ New Chat]     │                                           │
+│                  │ ── Analysis results (inline, collapsible)─│
+│ Your Chats       │ ▶ 📋 Summary      (collapsed by default) │
+│ • Chat 1         │ ▶ 🔬 Entities     (collapsed by default) │
+│ • Chat 2         │ ▶ 🔍 Gaps         (collapsed by default) │
+│                  │ ▶ 📊 Comparison   (collapsed by default) │
+│                  │ ▶ 📚 Lit Review   (collapsed by default) │
+│                  │                                           │
+│                  │ ── Chat messages ─────────────────────── │
+│                  │ 👤 User message                          │
+│                  │ 🤖 Assistant answer                      │
+│                  │                                           │
+│                  │ [Ask about your research paper ...]      │
+└─────────────────────────────────────────────────────────────┘
+ ```
+
+ ```bash
+ Upload PDF → indexed in Qdrant
+        ↓
+"✅ Paper processed! Click Get Analysis"
+        ↓
+[Get Analysis button] → orchestrator runs all agents
+        ↓
+Results appear inline as collapsible expanders:
+  ▼ 📋 Summary        (expanded by default)
+  ▶ 🔬 Entities
+  ▶ 🔍 Research Gaps & Future Directions
+  ▶ 🔗 Similar Papers (arXiv)
+  ▶ 📊 Comparison
+  ▶ 📚 Literature Review
+        ↓
+Chat messages below analysis
+        ↓
+[Ask about your research paper …]  ← always at bottom
+ ```

@@ -37,7 +37,8 @@ class _BARTModel:
                         "summarization",
                         model="facebook/bart-large-cnn",
                         device=device,
-                        local_files_only=False,   # downloads on first run
+                        local_files_only=True, # downloads on first run
+                        framework="pt",          
                     )
                     logger.info("BART ready.")
         return cls._instance
