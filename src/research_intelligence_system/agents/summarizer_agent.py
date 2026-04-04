@@ -36,9 +36,13 @@ class _BARTModel:
                     import torch
                     cls._device    = "cuda" if torch.cuda.is_available() else "cpu"
                     logger.info(f"Loading BART on {cls._device.upper()} …")
-                    cls._tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
+                    cls._tokenizer = BartTokenizer.from_pretrained(
+                        "facebook/bart-large-cnn",
+                        local_files_only = True
+                        )
                     cls._model_obj = BartForConditionalGeneration.from_pretrained(
-                        "facebook/bart-large-cnn"
+                        "facebook/bart-large-cnn",
+                        local_files_only = True
                     ).to(cls._device)
                     cls._model_obj.eval()
                     cls._instance  = True

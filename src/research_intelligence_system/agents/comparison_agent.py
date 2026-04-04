@@ -121,8 +121,8 @@ def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
 
     paper    = analyses[0]
     entities = paper.entities or {}
-    methods  = entities.get("methods", [])[:3]
-    models   = entities.get("models",  [])[:2]
+    methods = list(dict.fromkeys(entities.get("methods", [])[:3]))
+    models  = list(dict.fromkeys(entities.get("models",  [])[:2]))
 
     # clean title — strip hash prefix from filename
     title = _clean_title(paper.filename or "")
