@@ -21,9 +21,9 @@ logger = get_logger(__name__)
 class ComparisonState(TypedDict):
     chat_id:          str
     llm_id:           str
-    paper_analyses:   List[Any]       # PaperAnalysis ORM objects
-    use_web:          bool            # True if single paper
-    web_papers:       List[Dict]      # fetched from arXiv + Tavily
+    paper_analyses:   List[Any]
+    use_web:          bool
+    web_papers:       List[Dict]
     comparison_table: Dict[str, Any]
     ranking:          List[str]
     evolution_trends: str
@@ -36,6 +36,19 @@ class ComparisonState(TypedDict):
 # ── LLM ──────────────────────────────────────────────────────────────────────
 def _get_llm(llm_id: str) -> ChatGroq:
     return ChatGroq(model=llm_id, temperature=0.2)
+
+
+# ── Title cleaner ─────────────────────────────────────────────────────────────
+def _clean_title(filename: str) -> str:
+    """Remove MD5 hash prefix and clean filename into readable title."""
+    name = filename or "Uploaded Paper"
+    # remove 32-char hex hash prefix + underscore
+    name = re.sub(r'^[a-f0-9]{32}_', '', name)
+    # remove .pdf extension
+    name = re.sub(r'\.pdf$', '', name, flags=re.IGNORECASE)
+    # replace underscores with spaces
+    name = name.replace("_", " ").strip()
+    return name or "Uploaded Paper"
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -108,23 +121,28 @@ def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
 
     paper    = analyses[0]
     entities = paper.entities or {}
-    title    = ""
     methods  = entities.get("methods", [])[:3]
     models   = entities.get("models",  [])[:2]
 
-    # try to get title from summary or filename
-    summary = paper.refined_summary or ""
-    if paper.filename:
-        title = paper.filename.replace(".pdf", "").replace("_", " ")
+    # clean title — strip hash prefix from filename
+    title = _clean_title(paper.filename or "")
 
-    query = f"{title} {' '.join(models)} {' '.join(methods)}".strip()[:200]
+    # build search query — use clean title + top models + methods
+    query_parts = []
+    if title and title != "Uploaded Paper":
+        query_parts.extend(title.split()[:5])   # first 5 words of title
+    query_parts.extend(models[:2])
+    query_parts.extend(methods[:2])
+    query = " ".join(query_parts).strip()[:150]
+
+    logger.info(f"[COMPARISON] arXiv query: {query!r}")
 
     web_papers = []
 
     # arXiv search
     try:
         import arxiv
-        search  = arxiv.Search(
+        search = arxiv.Search(
             query      = query,
             max_results= 5,
             sort_by    = arxiv.SortCriterion.Relevance,
@@ -142,10 +160,11 @@ def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
     except Exception as e:
         logger.warning(f"[COMPARISON] arXiv failed: {e}")
 
-    # Tavily search for additional context
+    # Tavily — use clean title, not hash
     try:
         from src.research_intelligence_system.tools.web_search import sync_web_search
-        web_text = sync_web_search(f"research papers similar to {title} {' '.join(models)}")
+        tavily_query = f"research papers similar to {title} {' '.join(models[:2])}"
+        web_text     = sync_web_search(tavily_query)
         if web_text:
             web_papers.append({
                 "title":    "Web Search Results",
@@ -164,15 +183,16 @@ def _compare_node(state: ComparisonState) -> ComparisonState:
 
     analyses = state["paper_analyses"]
     if not analyses:
-        return {**state, "error": "no papers to compare", "retry_count": state["retry_count"] + 1}
+        return {**state, "error": "no papers to compare",
+                "retry_count": state["retry_count"] + 1}
 
     try:
         llm = _get_llm(state["llm_id"])
 
         if state["use_web"]:
-            # ── Single paper + web context ────────────────────────────────────
             paper    = analyses[0]
             entities = paper.entities or {}
+            title    = _clean_title(paper.filename or "")
 
             web_text = "\n".join([
                 f"- {p.get('title', 'Unknown')} ({p.get('year', '')}): {p.get('abstract', '')[:300]}"
@@ -180,21 +200,21 @@ def _compare_node(state: ComparisonState) -> ComparisonState:
             ]) or "No related papers found online."
 
             prompt = _WEB_COMPARISON_PROMPT.format(
-                title    = paper.filename.replace(".pdf", "") if paper.filename else "Uploaded Paper",
-                summary  = (paper.refined_summary or "")[:1000],
-                models   = ", ".join(entities.get("models",   [])[:8]),
-                datasets = ", ".join(entities.get("datasets", [])[:8]),
-                metrics  = ", ".join(entities.get("metrics",  [])[:8]),
-                methods  = ", ".join(entities.get("methods",  [])[:8]),
+                title     = title,
+                summary   = (paper.refined_summary or "")[:1000],
+                models    = ", ".join(entities.get("models",   [])[:8]),
+                datasets  = ", ".join(entities.get("datasets", [])[:8]),
+                metrics   = ", ".join(entities.get("metrics",  [])[:8]),
+                methods   = ", ".join(entities.get("methods",  [])[:8]),
                 web_papers= web_text,
             )
         else:
-            # ── Multi-paper direct comparison ─────────────────────────────────
             papers_text = ""
             for i, paper in enumerate(analyses, 1):
                 entities = paper.entities or {}
+                title    = _clean_title(paper.filename or f"Paper {i}")
                 papers_text += f"""
-Paper {i}: {paper.filename or f'Paper {i}'}
+Paper {i}: {title}
 Summary:  {(paper.refined_summary or '')[:500]}
 Models:   {', '.join(entities.get('models',   [])[:5])}
 Datasets: {', '.join(entities.get('datasets', [])[:5])}
@@ -214,7 +234,10 @@ Methods:  {', '.join(entities.get('methods',  [])[:5])}
         if not json_match:
             raise ValueError("No JSON in comparison response")
 
-        result = json.loads(json_match.group())
+        # clean control characters before parsing
+        cleaned = json_match.group()
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
+        result  = json.loads(cleaned)
 
         logger.info(f"[COMPARISON] done — {len(result.get('ranking', []))} papers ranked")
 
@@ -242,10 +265,6 @@ def _should_retry(state: ComparisonState) -> str:
     if state.get("error") and state["retry_count"] < 2:
         return "compare"
     return END
-
-
-def _after_fetch(state: ComparisonState) -> str:
-    return "compare"
 
 
 # ── Graph ─────────────────────────────────────────────────────────────────────
@@ -280,11 +299,6 @@ class ComparisonAgent:
         paper_analyses: List[Any],
         use_web:        bool = False,
     ) -> Dict[str, Any]:
-        """
-        Run comparison pipeline.
-        use_web=True  → single paper + arXiv/Tavily
-        use_web=False → direct multi-paper comparison
-        """
         import asyncio
         loop = asyncio.get_running_loop()
 

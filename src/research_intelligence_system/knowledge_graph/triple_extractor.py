@@ -102,6 +102,7 @@ def _extract_triples_node(state: TripleState) -> TripleState:
         llm      = _get_llm(state["llm_id"])
         response = llm.invoke(prompt)
         raw      = response.content.strip()
+        logger.info(f"[TRIPLES DEBUG] raw={raw[:300]}")
 
         # extract JSON array from response
         json_match = re.search(r'\[.*\]', raw, re.DOTALL)

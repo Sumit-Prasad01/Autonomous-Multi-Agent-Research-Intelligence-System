@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
+from transformers import BartForConditionalGeneration, BartTokenizer
 
 from src.research_intelligence_system.utils.logger import get_logger
 
@@ -21,27 +22,28 @@ _POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="summarizer")
 
 # ── Singleton BART model ──────────────────────────────────────────────────────
 class _BARTModel:
-    _instance = None
-    _lock     = threading.Lock()
+    _instance  = None
+    _tokenizer = None
+    _model_obj = None
+    _device    = "cpu"
+    _lock      = threading.Lock()
 
     @classmethod
     def get(cls):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    from transformers import pipeline
                     import torch
-                    device = 0 if torch.cuda.is_available() else -1
-                    logger.info(f"Loading BART on {'CUDA' if device == 0 else 'CPU'} …")
-                    cls._instance = pipeline(
-                        "summarization",
-                        model="facebook/bart-large-cnn",
-                        device=device,
-                        local_files_only=True, # downloads on first run
-                        framework="pt",          
-                    )
+                    cls._device    = "cuda" if torch.cuda.is_available() else "cpu"
+                    logger.info(f"Loading BART on {cls._device.upper()} …")
+                    cls._tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
+                    cls._model_obj = BartForConditionalGeneration.from_pretrained(
+                        "facebook/bart-large-cnn"
+                    ).to(cls._device)
+                    cls._model_obj.eval()
+                    cls._instance  = True
                     logger.info("BART ready.")
-        return cls._instance
+        return cls
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -69,20 +71,24 @@ class SummaryState(TypedDict):
 def _summarize_text(text: str, max_tokens: int, min_tokens: int = 30) -> str:
     if len(text) < _MIN_INPUT_CHARS:
         return text
-
-    model  = _BARTModel.get()
-    # BART input limit is 1024 tokens — truncate safely
-    text   = text[:3000]
-
-    result = model(
-        text,
-        max_length=max_tokens,
-        min_length=min_tokens,
-        do_sample=False,
+    import torch
+    m      = _BARTModel.get()
+    inputs = m._tokenizer(
+        text[:3000],
+        return_tensors="pt",
         truncation=True,
-    )
-    return result[0]["summary_text"].strip()
-
+        max_length=1024,
+    ).to(m._device)
+    with torch.no_grad():
+        ids = m._model_obj.generate(
+            inputs["input_ids"],
+            max_length    = max_tokens,
+            min_length    = min_tokens,
+            length_penalty= 2.0,
+            num_beams     = 4,
+            early_stopping= True,
+        )
+    return m._tokenizer.decode(ids[0], skip_special_tokens=True)
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 def _summarize_section_task(args: tuple) -> tuple:

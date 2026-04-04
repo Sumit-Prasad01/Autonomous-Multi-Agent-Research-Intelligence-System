@@ -55,41 +55,22 @@ Return ONLY valid JSON:
 Return only JSON, no explanation."""
 
 
-_REVIEW_PROMPT = """You are an expert academic writer specializing in literature reviews.
-Write a comprehensive literature review based on the papers below.
+_REVIEW_PROMPT = """You are an academic writer. Write a literature review and return it as JSON.
 
-Papers analyzed:
+Papers:
 {papers_text}
 
-Identified themes:
-{themes}
+Themes: {themes}
 
-Comparison results:
-{comparison}
+Comparison: {comparison}
 
-Write a structured literature review following this format:
+CRITICAL RULES:
+- Return ONLY a JSON object
+- NO actual newline characters inside string values — use spaces instead
+- NO markdown, NO code blocks, NO explanation
 
-1. **Introduction**: Briefly introduce the research area and scope
-2. **Thematic Analysis**: Discuss each theme with relevant papers
-3. **Comparative Analysis**: Highlight key differences and similarities
-4. **Research Gaps**: Identify unexplored areas
-5. **Future Directions**: Suggest promising research directions
-
-Guidelines:
-- Be academic and precise
-- Cite papers by their filename/title
-- 400-600 words total
-- Connect ideas across papers
-
-Return ONLY valid JSON:
-{{
-  "review_text": "Full literature review text here...",
-  "research_gaps_summary": "2-3 sentence summary of key gaps identified",
-  "future_directions": "2-3 sentence summary of future research directions",
-  "overall_quality": <float 0-10, quality of the literature body reviewed>
-}}
-
-Return only JSON, no explanation."""
+Return exactly this structure:
+{{"review_text": "Introduction: ... Thematic Analysis: ... Comparative Analysis: ... Research Gaps: ... Future Directions: ...", "research_gaps_summary": "Summary of gaps in 2 sentences.", "future_directions": "Future directions in 2 sentences.", "overall_quality": 7.5}}"""
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -119,10 +100,13 @@ def _extract_themes_node(state: LitReviewState) -> LitReviewState:
 
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
-            raise ValueError("No JSON in theme response")
-        
+            raise ValueError("No JSON in review response")
         cleaned = json_match.group()
-        cleaned = re.sub(r'[\x00-\x1f\x7f](?<![\n\t])', ' ', cleaned)
+        # remove control characters that break json.loads
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
+        # replace actual newlines inside strings with space
+        cleaned = re.sub(r'\n', ' ', cleaned)
+        cleaned = re.sub(r'\r', ' ', cleaned)
         result  = json.loads(cleaned)
         themes = result.get("themes", [])
 
@@ -183,9 +167,12 @@ Research Gaps:    {'; '.join(gaps[:3])}
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
             raise ValueError("No JSON in review response")
-        
         cleaned = json_match.group()
-        cleaned = re.sub(r'[\x00-\x1f\x7f](?<![\n\t])', ' ', cleaned)
+        # remove control characters that break json.loads
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
+        # replace actual newlines inside strings with space
+        cleaned = re.sub(r'\n', ' ', cleaned)
+        cleaned = re.sub(r'\r', ' ', cleaned)
         result  = json.loads(cleaned)
 
         review_text           = result.get("review_text", "")

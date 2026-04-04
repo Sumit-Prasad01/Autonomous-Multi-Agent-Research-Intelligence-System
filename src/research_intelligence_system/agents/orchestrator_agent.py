@@ -102,7 +102,14 @@ async def _run_single_paper(
         # ── Stage 4: Summarization ────────────────────────────────────────────
         logger.info(f"[ORCHESTRATOR] summarization paper_id={paper_id}")
         summarizer_agent = SummarizerAgent()
+
+        # ensure minimum content per section
+        for section in ["abstract", "methodology", "results", "conclusion"]:
+            if not sections_text.get(section) or len(sections_text.get(section, "")) < 200:
+                sections_text[section] = sections_text.get("body", "")[:3000]
+
         summaries = await summarizer_agent.summarize(paper_id, sections_text)
+
         await save_summaries(db, paper_id, summaries)
 
         # ── Stage 5: Critic ───────────────────────────────────────────────────
