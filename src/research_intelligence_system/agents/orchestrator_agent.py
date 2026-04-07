@@ -99,23 +99,18 @@ async def _run_single_paper(
         entities = await extraction_agent.extract(paper_id, sections_text)
         await save_entities(db, paper_id, entities)
 
-        # ── Stage 4: Summarization ────────────────────────────────────────────
+        # ── Stage 4: Summarization (two-stage: BART + LLM synthesis) ───────────
         logger.info(f"[ORCHESTRATOR] summarization paper_id={paper_id}")
-        summarizer_agent = SummarizerAgent()
-
-        # ensure minimum content per section
-        for section in ["abstract", "methodology", "results", "conclusion"]:
-            if not sections_text.get(section) or len(sections_text.get(section, "")) < 200:
-                sections_text[section] = sections_text.get("body", "")[:3000]
-
-        summaries = await summarizer_agent.summarize(paper_id, sections_text)
-
+        summarizer_agent = SummarizerAgent(llm_id=llm_id)
+        summaries = await summarizer_agent.summarize(paper_id, sections_text, entities)
         await save_summaries(db, paper_id, summaries)
 
         # ── Stage 5: Critic ───────────────────────────────────────────────────
         logger.info(f"[ORCHESTRATOR] critic paper_id={paper_id}")
         critic_agent = CriticAgent(llm_id=llm_id)
-        critic_result = await critic_agent.evaluate(paper_id, summaries, entities)
+        # pass comprehensive summary to critic for better evaluation
+        critic_summaries = {**summaries, "overall": summaries.get("comprehensive", summaries.get("overall", ""))}
+        critic_result = await critic_agent.evaluate(paper_id, critic_summaries, entities)
         await save_critic_output(
             db, paper_id,
             refined_summary  = critic_result["refined_summary"],
