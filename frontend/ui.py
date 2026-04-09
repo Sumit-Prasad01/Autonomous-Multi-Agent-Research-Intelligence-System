@@ -174,11 +174,27 @@ def _delete_chat(cid: str):
 def _switch_chat(cid: str):
     st.session_state.current_chat_id = cid
     chat = st.session_state.chats[cid]
+
+    # load chat history
     if not chat["messages"]:
         r = _api("get", f"/chats/{cid}/history")
         if r and r.status_code == 200:
             chat["messages"] = r.json()
             chat["ready"]    = bool(chat["messages"])
+
+    # restore analyzed flag from backend
+    if not chat.get("analyzed"):
+        r = _api("get", f"/chats/{cid}/analysis-status", show_error=False)
+        if r and r.status_code == 200:
+            status = r.json().get("status", "")
+            if status == "complete":
+                chat["analyzed"] = True
+                # also restore analysis data if not in cache
+                if cid not in st.session_state.analysis_cache:
+                    data = _fetch_analysis(cid)
+                    if data:
+                        st.session_state.analysis_cache[cid] = data
+
     st.rerun()
 
 

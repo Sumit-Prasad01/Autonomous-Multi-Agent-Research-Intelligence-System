@@ -36,6 +36,10 @@ from src.research_intelligence_system.services.chat_service import (
 from src.research_intelligence_system.services.redis_service import (
     check_redis_health, create_session, get_session, delete_session
 )
+from src.research_intelligence_system.database.paper_repository import (
+    get_paper_analyses, get_paper_analysis,
+    get_comparison, get_literature_review,
+)
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger   = get_logger(__name__)
@@ -356,6 +360,10 @@ async def get_analysis(
     if not analyses:
         raise HTTPException(404, "No analysis found. Run 'Get Analysis' first.")
 
+    # fetch comparison + literature review
+    comparison   = await get_comparison(db, chat_id)
+    lit_review   = await get_literature_review(db, chat_id)
+
     return {
         "papers": [
             {
@@ -372,7 +380,22 @@ async def get_analysis(
                 "similar_papers":    a.similar_papers,
             }
             for a in analyses
-        ]
+        ],
+        "comparison": {
+            "comparison_table":  comparison.comparison_table  if comparison else {},
+            "ranking":           comparison.ranking           if comparison else [],
+            "evolution_trends":  comparison.evolution_trends  if comparison else "",
+            "positioning":       comparison.positioning       if comparison else "",
+            "web_papers_used":   comparison.web_papers_used   if comparison else [],
+            "comparison_type":   comparison.comparison_type   if comparison else "",
+        } if comparison else {},
+        "literature_review": {
+            "themes":                lit_review.themes                if lit_review else [],
+            "review_text":           lit_review.review_text           if lit_review else "",
+            "research_gaps_summary": lit_review.research_gaps_summary if lit_review else "",
+            "future_directions":     lit_review.future_directions     if lit_review else "",
+            "overall_quality":       lit_review.overall_quality       if lit_review else 0.0,
+        } if lit_review else {},
     }
 
 

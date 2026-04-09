@@ -105,7 +105,7 @@ def _compute_missing_edges_from_neo4j(chat_id: str, entities: Dict) -> List[Dict
 
         # get existing edges (model → task)
         existing_model_task = set(
-            (e["model"], e["task"])
+            (e.get("model", ""), e.get("task", e.get("dataset", "")))
             for e in neo4j.get_edges_by_type(chat_id, "APPLIED_TO")
         )
 
