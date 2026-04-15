@@ -25,21 +25,33 @@ logger = get_logger(__name__)
 
 
 def _build_history(messages: List[dict]) -> str:
-    return "\n".join(
-        f"{m['role'].upper()}: {m['content'].strip()}"
-        for m in messages[-MAX_HISTORY:]
-        if m["content"].strip()
-    )
+    """Keep last 3 QA pairs — trim long answers to avoid token bloat."""
+    recent = messages[-MAX_HISTORY:]
+    parts  = []
+    for m in recent:
+        content = m["content"].strip()
+        if not content:
+            continue
+        role = m["role"].upper()
+        # trim long assistant answers — full answer is in Postgres, not needed here
+        if role == "ASSISTANT" and len(content) > 300:
+            content = content[:300] + "…"
+        parts.append(f"{role}: {content}")
+    return "\n".join(parts)
 
 
 def _build_query(history: str, query: str) -> str:
+    """Build query with conversation history for reference resolution."""
     query = query.strip()[:MAX_Q_CHARS]
     if not history:
         return query
     return (
-        f"Conversation Context:\n{history}\n\n"
-        f"User Question:\n{query}\n\n"
-        "Answer using the context above if relevant."
+        f"Previous conversation:\n{history}\n\n"
+        f"Current question: {query}\n\n"
+        "Answer the current question using the paper context below. "
+        "If the question refers to something from the conversation "
+        "(e.g. 'it', 'that method', 'the model mentioned'), "
+        "resolve the reference from the conversation history above."
     )
 
 

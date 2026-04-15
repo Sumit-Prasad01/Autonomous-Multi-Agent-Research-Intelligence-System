@@ -388,10 +388,25 @@ def _render_analysis(analysis: Dict):
         # ── Research Gaps ─────────────────────────────────────────────────────
         with st.expander("🔍 Research Gaps & Future Directions"):
             if gaps:
-                st.markdown("**Research Gaps:**")
-                for gap in gaps:
-                    st.markdown(f'<div class="gap-item">🔹 {gap}</div>',
-                                unsafe_allow_html=True)
+                st.markdown("**Research Gaps (ranked by novelty):**")
+                for i, gap in enumerate(gaps, 1):
+                    if isinstance(gap, dict):
+                        score    = gap.get("novelty_score", 0)
+                        color    = "#ef4444" if score >= 8 else "#f97316" if score >= 6 else "#eab308"
+                        st.markdown(
+                            f'<div class="gap-item">'
+                            f'<b>#{i} [{score:.1f}/10]</b> {gap["gap"]}<br>'
+                            f'<small>📎 {gap.get("supporting_evidence", "")}</small><br>'
+                            f'<small>🧪 <i>{gap.get("suggested_experiment", "")}</i></small>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        # fallback for plain string gaps
+                        st.markdown(
+                            f'<div class="gap-item">🔹 {gap}</div>',
+                            unsafe_allow_html=True,
+                        )
             else:
                 st.info("No gaps detected yet.")
             if dirs:

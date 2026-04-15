@@ -39,38 +39,48 @@ def _get_llm(llm_id: str) -> ChatGroq:
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 _GAP_INTERPRETATION_PROMPT = """You are a research gap analyst.
-Given missing combinations in a knowledge graph, identify research gaps.
-
+Given missing combinations in a knowledge graph, identify and RANK research gaps.
+ 
 Paper entities:
 Models:   {models}
 Datasets: {datasets}
 Tasks:    {tasks}
-
+ 
 Missing combinations (not evaluated/explored):
 {missing_edges}
-
+ 
 Similar papers found:
 {similar_papers}
-
-Return ONLY valid JSON:
+ 
+Return ONLY valid JSON with NO newlines inside string values:
 {{
   "research_gaps": [
-    "Clear description of gap 1",
-    "Clear description of gap 2"
+    {{
+      "gap": "Clear 1-2 sentence description of the gap mentioning specific model/dataset/task names",
+      "novelty_score": <float 0-10>,
+      "supporting_evidence": "Why this gap exists — cite similar papers if relevant",
+      "suggested_experiment": "Specific actionable experiment to address this gap"
+    }}
   ],
   "future_directions": [
     "Specific actionable future work suggestion 1",
     "Specific actionable future work suggestion 2"
   ],
-  "novelty_score": <float 0-10, how novel/unexplored the gaps are>
+  "overall_novelty_score": <float 0-10, overall novelty of the gap landscape>
 }}
-
+ 
+Scoring guide for novelty_score per gap:
+9-10: Completely unexplored — no similar paper addresses this
+7-8:  Partially explored — some papers touch on it but not directly
+5-6:  Known gap — mentioned in literature but not solved
+0-4:  Well explored — many papers address this
+ 
 Rules:
+- Return 3-8 gaps ranked by novelty_score descending
 - Be specific — mention actual model/dataset/task names
-- Each gap should be 1-2 sentences
-- Future directions should be actionable research proposals
-- novelty_score: 9-10 if gaps are completely unexplored, 5-6 if partially explored
-- Return only JSON, no explanation."""
+- supporting_evidence should reference similar papers found if applicable
+- suggested_experiment should be a concrete, runnable experiment
+- Return only JSON, no explanation, no markdown"""
 
 
 # ── Core: structural gap computation ─────────────────────────────────────────
@@ -192,64 +202,91 @@ def _compute_gaps_node(state: GapState) -> GapState:
 
 
 def _interpret_gaps_node(state: GapState) -> GapState:
-    """LLM interprets missing edges as human-readable research gaps."""
+    """LLM interprets missing edges as ranked, scored research gaps."""
     logger.info(f"[GAP] interpreting {len(state['missing_edges'])} missing edges")
-
-    missing_edges   = state.get("missing_edges", [])
-    entities        = state.get("entities", {})
-    similar_papers  = state.get("similar_papers", [])
-
+ 
+    missing_edges  = state.get("missing_edges", [])
+    entities       = state.get("entities", {})
+    similar_papers = state.get("similar_papers", [])
+ 
     if not missing_edges and not entities:
         return {
             **state,
-            "research_gaps":     ["No specific gaps detected."],
+            "research_gaps":     [],
             "future_directions": ["Further evaluation on diverse benchmarks."],
             "novelty_score":     5.0,
         }
-
-    # format missing edges for prompt
+ 
     missing_text = "\n".join([
         f"- {e['gap']}" for e in missing_edges[:15]
     ]) or "No structural gaps found — using entity analysis."
-
-    # format similar papers
+ 
     similar_text = "\n".join([
         f"- {p.get('title', '')} ({p.get('year', '')})"
         for p in similar_papers[:5]
     ]) or "No similar papers found."
-
+ 
     prompt = _GAP_INTERPRETATION_PROMPT.format(
-        models        = ", ".join(entities.get("models",   [])[:10]),
-        datasets      = ", ".join(entities.get("datasets", [])[:10]),
-        tasks         = ", ".join(entities.get("tasks",    [])[:10]),
-        missing_edges = missing_text,
-        similar_papers= similar_text,
+        models         = ", ".join(entities.get("models",   [])[:10]),
+        datasets       = ", ".join(entities.get("datasets", [])[:10]),
+        tasks          = ", ".join(entities.get("tasks",    [])[:10]),
+        missing_edges  = missing_text,
+        similar_papers = similar_text,
     )
-
+ 
     try:
         llm      = _get_llm(state["llm_id"])
         response = llm.invoke(prompt)
         raw      = response.content.strip()
-
+ 
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
             raise ValueError("No JSON in gap interpretation response")
-
-        result = json.loads(json_match.group())
-
-        research_gaps     = result.get("research_gaps", [])
+ 
+        cleaned = json_match.group()
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
+        result  = json.loads(cleaned)
+ 
+        # new structured gaps list
+        raw_gaps          = result.get("research_gaps", [])
         future_directions = result.get("future_directions", [])
-        novelty_score     = float(result.get("novelty_score", 5.0))
-
-        logger.info(f"[GAP] found {len(research_gaps)} gaps novelty={novelty_score}")
+        novelty_score     = float(result.get("overall_novelty_score", 5.0))
+ 
+        # validate and sort gaps by novelty_score descending
+        structured_gaps = []
+        for g in raw_gaps:
+            if isinstance(g, dict):
+                structured_gaps.append({
+                    "gap":                  str(g.get("gap", "")),
+                    "novelty_score":        float(g.get("novelty_score", 5.0)),
+                    "supporting_evidence":  str(g.get("supporting_evidence", "")),
+                    "suggested_experiment": str(g.get("suggested_experiment", "")),
+                })
+            elif isinstance(g, str):
+                # fallback if LLM returns plain strings
+                structured_gaps.append({
+                    "gap":                  g,
+                    "novelty_score":        5.0,
+                    "supporting_evidence":  "",
+                    "suggested_experiment": "",
+                })
+ 
+        # sort by novelty_score descending
+        structured_gaps.sort(key=lambda x: x["novelty_score"], reverse=True)
+ 
+        logger.info(
+            f"[GAP] found {len(structured_gaps)} ranked gaps "
+            f"overall_novelty={novelty_score}"
+        )
+ 
         return {
             **state,
-            "research_gaps":     research_gaps,
+            "research_gaps":     structured_gaps,
             "future_directions": future_directions,
             "novelty_score":     novelty_score,
             "error":             "",
         }
-
+ 
     except Exception as e:
         logger.warning(f"[GAP] LLM interpretation failed attempt {state['retry_count']+1}: {e}")
         return {

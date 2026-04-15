@@ -59,8 +59,8 @@ ALGORITHM     = "HS256"
 ACCESS_TTL    = 60 * 24        # minutes — 1 day
 
 # services/chat_service.py
-MAX_HISTORY = 10
-MAX_Q_CHARS = 1500
+MAX_HISTORY = 6
+MAX_Q_CHARS = 800
 
 # services/redis_service.py
 MAX_MEMORY_MSGS = 10          # messages kept hot in Redis per chat
