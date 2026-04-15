@@ -254,13 +254,12 @@ class Neo4jService:
             return []
 
     def get_edges_by_type(self, chat_id: str, relation: str) -> List[Dict]:
-        """Get all edges of a given relation type for this chat."""
         try:
             relation = relation.upper().replace(" ", "_")
             results  = self._run(
                 f"""
                 MATCH (s {{chat_id: $chat_id}})-[r:{relation}]->(o {{chat_id: $chat_id}})
-                RETURN s.name AS model, o.name AS dataset
+                RETURN s.name AS model, o.name AS dataset, o.name AS task
                 """,
                 chat_id=chat_id,
             )

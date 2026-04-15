@@ -22,6 +22,17 @@ from src.research_intelligence_system.database.paper_repository import (
     save_critic_output, save_triples, save_similar_papers,
     save_gaps, set_analysis_status,
 )
+from src.research_intelligence_system.knowledge_graph.graph_builder import GraphBuilder
+from src.research_intelligence_system.agents.gap_detection_agent import GapDetectionAgent
+from src.research_intelligence_system.tools.arxiv_service import ArxivService
+from src.research_intelligence_system.rag.vector_store import _store
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+from src.research_intelligence_system.constants import COLLECTION_NAME
+from src.research_intelligence_system.agents.comparison_agent import ComparisonAgent
+from src.research_intelligence_system.database.paper_repository import (
+        get_paper_analyses, save_comparison, save_literature_review
+    )
+from src.research_intelligence_system.agents.literature_review_agent import LiteratureReviewAgent
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,10 +72,6 @@ async def _run_single_paper(
             raise ValueError(f"PaperAnalysis not found: {paper_id}")
 
         # ── fetch chunks from Qdrant to get sections ──────────────────────────
-        from src.research_intelligence_system.rag.vector_store import _store
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
-        from src.research_intelligence_system.constants import COLLECTION_NAME
-
         results, _ = _store.client.scroll(
             collection_name=COLLECTION_NAME,
             scroll_filter=Filter(must=[FieldCondition(
@@ -128,7 +135,6 @@ async def _run_single_paper(
         # ── Stage 7: Neo4j Graph ──────────────────────────────────────────────
         logger.info(f"[ORCHESTRATOR] building graph paper_id={paper_id}")
         try:
-            from src.research_intelligence_system.knowledge_graph.graph_builder import GraphBuilder
             graph_builder = GraphBuilder()
             await graph_builder.build(chat_id, paper_id, entities, triples)
         except Exception as e:
@@ -137,13 +143,13 @@ async def _run_single_paper(
         # ── Stage 8: Similar Papers (arXiv) ──────────────────────────────────
         logger.info(f"[ORCHESTRATOR] fetching similar papers paper_id={paper_id}")
         try:
-            from src.research_intelligence_system.tools.arxiv_service import ArxivService
             arxiv   = ArxivService()
             title   = entities.get("title", "")
             methods = entities.get("methods", [])[:3]
             query   = f"{title} {' '.join(methods)}".strip()
             similar = await arxiv.search(query, max_results=5)
             await save_similar_papers(db, paper_id, similar)
+            await asyncio.sleep(2)
         except Exception as e:
             logger.warning(f"[ORCHESTRATOR] arXiv search failed (non-fatal): {e}")
             similar = []
@@ -151,7 +157,6 @@ async def _run_single_paper(
         # ── Stage 9: Gap Detection ────────────────────────────────────────────
         logger.info(f"[ORCHESTRATOR] gap detection paper_id={paper_id}")
         try:
-            from src.research_intelligence_system.agents.gap_detection_agent import GapDetectionAgent
             gap_agent = GapDetectionAgent(llm_id=llm_id)
             gap_result = await gap_agent.detect(
                 chat_id=chat_id,
@@ -235,11 +240,6 @@ async def _run_comparison_node(state: OrchestratorState, db: AsyncSession) -> Or
     """Stage 11 — comparison agent (web-augmented or direct)."""
     logger.info(f"[ORCHESTRATOR] comparison type={state['current_step']}")
     try:
-        from src.research_intelligence_system.agents.comparison_agent import ComparisonAgent
-        from src.research_intelligence_system.database.paper_repository import (
-            get_paper_analyses, save_comparison
-        )
-
         analyses   = await get_paper_analyses(db, state["chat_id"])
         comp_agent = ComparisonAgent(llm_id=state["llm_id"])
         comparison = await comp_agent.compare(
@@ -269,11 +269,6 @@ async def _run_literature_review_node(state: OrchestratorState, db: AsyncSession
     """Stage 12 — literature review agent."""
     logger.info("[ORCHESTRATOR] literature review")
     try:
-        from src.research_intelligence_system.agents.literature_review_agent import LiteratureReviewAgent
-        from src.research_intelligence_system.database.paper_repository import (
-            get_paper_analyses, save_literature_review
-        )
-
         analyses   = await get_paper_analyses(db, state["chat_id"])
         lit_agent  = LiteratureReviewAgent(llm_id=state["llm_id"])
         lit_review = await lit_agent.generate(

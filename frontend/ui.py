@@ -174,27 +174,11 @@ def _delete_chat(cid: str):
 def _switch_chat(cid: str):
     st.session_state.current_chat_id = cid
     chat = st.session_state.chats[cid]
-
-    # load chat history
     if not chat["messages"]:
         r = _api("get", f"/chats/{cid}/history")
         if r and r.status_code == 200:
             chat["messages"] = r.json()
             chat["ready"]    = bool(chat["messages"])
-
-    # restore analyzed flag from backend
-    if not chat.get("analyzed"):
-        r = _api("get", f"/chats/{cid}/analysis-status", show_error=False)
-        if r and r.status_code == 200:
-            status = r.json().get("status", "")
-            if status == "complete":
-                chat["analyzed"] = True
-                # also restore analysis data if not in cache
-                if cid not in st.session_state.analysis_cache:
-                    data = _fetch_analysis(cid)
-                    if data:
-                        st.session_state.analysis_cache[cid] = data
-
     st.rerun()
 
 
@@ -269,6 +253,83 @@ def _fetch_analysis(cid: str) -> Optional[Dict]:
     if r and r.status_code == 200:
         return r.json()
     return None
+
+
+# ── PyVis Knowledge Graph ────────────────────────────────────────────────────
+def _render_knowledge_graph(chat_id: str, papers: list):
+    """Fetch triples from paper analyses and render as PyVis graph."""
+    try:
+        from pyvis.network import Network
+        import streamlit.components.v1 as components
+
+        # collect all triples from all papers
+        all_triples = []
+        for paper in papers:
+            triples = paper.get("triples", [])
+            all_triples.extend(triples)
+
+        if not all_triples:
+            st.info("No knowledge graph available — triples not extracted yet.")
+            return
+
+        # build PyVis network
+        net = Network(
+            height="500px",
+            width="100%",
+            bgcolor="#0e1117",
+            font_color="white",
+            directed=True,
+        )
+        net.barnes_hut(gravity=-8000, central_gravity=0.3, spring_length=120)
+
+        # color map by relation type
+        relation_colors = {
+            "TRAINED_ON":    "#60a5fa",
+            "EVALUATED_ON":  "#34d399",
+            "ACHIEVES":      "#fbbf24",
+            "USES":          "#a78bfa",
+            "IMPROVES_OVER": "#f87171",
+            "PROPOSED_BY":   "#fb923c",
+            "APPLIED_TO":    "#38bdf8",
+            "COMPARED_WITH": "#e879f9",
+            "BASED_ON":      "#4ade80",
+            "REPLACES":      "#f43f5e",
+        }
+
+        nodes_added = set()
+
+        for t in all_triples[:60]:   # cap at 60 triples for performance
+            subject  = str(t.get("subject", "")).strip()
+            relation = str(t.get("relation", "")).strip().upper()
+            obj      = str(t.get("object",  "")).strip()
+
+            if not subject or not obj:
+                continue
+
+            if subject not in nodes_added:
+                net.add_node(subject, label=subject, color="#60a5fa",
+                             size=20, title=subject)
+                nodes_added.add(subject)
+
+            if obj not in nodes_added:
+                net.add_node(obj, label=obj, color="#4ade80",
+                             size=15, title=obj)
+                nodes_added.add(obj)
+
+            edge_color = relation_colors.get(relation, "#888888")
+            net.add_edge(subject, obj, label=relation,
+                         color=edge_color, title=relation)
+
+        # generate HTML
+        html = net.generate_html()
+        components.html(html, height=520, scrolling=False)
+
+        st.caption(f"📊 {len(nodes_added)} nodes · {min(len(all_triples), 60)} edges · colors by relation type")
+
+    except ImportError:
+        st.warning("Install pyvis: `uv pip install pyvis`")
+    except Exception as e:
+        st.error(f"Graph render failed: {e}")
 
 
 # ── Analysis renderers (inline, collapsible) ──────────────────────────────────
@@ -349,6 +410,13 @@ def _render_analysis(analysis: Dict):
                         f"[View on arXiv]({p.get('url', '#')})"
                     )
                     st.divider()
+
+    # ── Knowledge Graph ──────────────────────────────────────────────────────
+    with st.expander("🕸️ Knowledge Graph"):
+        _render_knowledge_graph(
+            chat_id=st.session_state.current_chat_id,
+            papers=papers,
+        )
 
     # ── Comparison (cross-paper) ──────────────────────────────────────────────
     comp = analysis.get("comparison", {})

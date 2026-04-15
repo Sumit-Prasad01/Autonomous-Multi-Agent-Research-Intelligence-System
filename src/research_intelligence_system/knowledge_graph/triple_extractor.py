@@ -72,6 +72,17 @@ Rules:
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
+def _clean_text_for_triples(text: str) -> str:
+    """Remove math formulas and noise before triple extraction."""
+    # remove repeated math patterns
+    text = re.sub(r'(\d+\s*[\+\-\*/]\s*exp\s*\([^)]*\)\s*[\.\,]?\s*){2,}', ' ', text)
+    # remove sequences of isolated numbers/symbols
+    text = re.sub(r'(\s+\d+\s+){3,}', ' ', text)
+    # remove ellipsis sequences
+    text = re.sub(r'(\.\s*){3,}', ' ', text)
+    return text.strip()
+
+
 def _extract_triples_node(state: TripleState) -> TripleState:
     """Extract knowledge triples using LLM."""
     logger.info(f"[TRIPLES] paper_id={state['paper_id']} attempt={state['retry_count']+1}")
@@ -87,8 +98,9 @@ def _extract_triples_node(state: TripleState) -> TripleState:
         sections.get("conclusion", "")[:500],
     ]).strip()
 
-    if not text:
-        return {**state, "triples": [], "error": "no text to extract triples from"}
+    text = _clean_text_for_triples(text)
+    if len(text) < 100:
+        return {**state, "triples": [], "error": "text too noisy after cleaning"}
 
     prompt = _TRIPLE_PROMPT.format(
         models   = ", ".join(entities.get("models",   [])[:15]),

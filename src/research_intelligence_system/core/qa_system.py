@@ -49,6 +49,47 @@ def _extract_question(query: str) -> str:
     return query
 
 
+def _compute_confidence(
+    query:         str,
+    rag_result:    str,
+    web_result:    str,
+    paper_context: str,
+) -> float:
+    """
+    Compute answer confidence based on:
+    - RAG coverage: keyword overlap between query and retrieved chunks
+    - Source richness: how many sources contributed
+    - Content length: longer RAG result = more relevant chunks found
+    """
+    if not rag_result and not web_result and not paper_context:
+        return 0.1
+
+    score = 0.0
+
+    # source richness (0.0 - 0.3)
+    sources = sum([bool(rag_result), bool(web_result), bool(paper_context)])
+    score  += sources * 0.1
+
+    # RAG keyword overlap (0.0 - 0.4)
+    if rag_result:
+        query_words  = set(query.lower().split())
+        result_words = set(rag_result.lower().split())
+        if query_words:
+            overlap = len(query_words & result_words) / len(query_words)
+            score  += min(overlap * 0.4, 0.4)
+
+    # RAG content length (0.0 - 0.2)
+    if rag_result:
+        length_score = min(len(rag_result) / 1000, 1.0) * 0.2
+        score       += length_score
+
+    # paper context bonus (0.0 - 0.1)
+    if paper_context and len(paper_context) > 100:
+        score += 0.1
+
+    return round(min(score, 1.0), 2)
+
+
 def _is_good(text: str) -> bool:
     return bool(text) and "not found" not in text.lower() and len(text.strip()) >= MIN_ANSWER
 
@@ -186,7 +227,7 @@ async def run_qa_system(
         answer = rag_result or paper_context or "Failed to generate answer."
 
     source     = "hybrid" if (rag_result and web_result) else ("rag" if rag_result else "web")
-    confidence = 0.85 if rag_result else 0.6
+    confidence = _compute_confidence(clean_query, rag_result, web_result, paper_context)
     result     = {"answer": answer, "source": source, "confidence": confidence}
 
     if len(answer) > 100:

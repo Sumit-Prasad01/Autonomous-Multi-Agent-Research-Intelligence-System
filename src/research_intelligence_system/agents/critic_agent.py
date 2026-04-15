@@ -144,6 +144,19 @@ def _critic_node(state: CriticState) -> CriticState:
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
             raise ValueError("No JSON in critic response")
+        cleaned = json_match.group()
+        cleaned = re.sub(r'[\x00-\x1f\x7f]', ' ', cleaned)
+        try:
+            evaluation = json.loads(cleaned)
+        except json.JSONDecodeError:
+            # try extracting individual fields
+            quality = re.search(r'"quality_score"\s*:\s*([\d.]+)', cleaned)
+            evaluation = {
+                "quality_score":    float(quality.group(1)) if quality else 5.0,
+                "missing_entities": [],
+                "inconsistencies":  [],
+                "feedback":         "Parse error — accepted as-is",
+            }
 
         evaluation       = json.loads(json_match.group())
         quality_score    = float(evaluation.get("quality_score", 5.0))
