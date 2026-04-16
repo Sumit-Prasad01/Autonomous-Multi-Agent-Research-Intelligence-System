@@ -425,6 +425,23 @@ def _render_analysis(analysis: Dict):
                         f"[View on arXiv]({p.get('url', '#')})"
                     )
                     st.divider()
+                    
+        # ── Paper2Code ────────────────────────────────────────────────────────
+        code = paper.get("code", {})
+        if code and (code.get("pseudocode") or code.get("python_skeleton")):
+            with st.expander("💻 Implementation (Paper2Code)"):
+                if code.get("time_complexity"):
+                    st.caption(f"⏱ Time: {code['time_complexity']}  |  💾 Space: {code.get('space_complexity', '')}")
+                if code.get("algorithm_steps"):
+                    st.markdown("**Algorithm Steps:**")
+                    for i, step in enumerate(code["algorithm_steps"], 1):
+                        st.markdown(f"{i}. {step}")
+                if code.get("pseudocode"):
+                    st.markdown("**Pseudocode:**")
+                    st.code(code["pseudocode"], language="text")
+                if code.get("python_skeleton"):
+                    st.markdown("**Python Skeleton:**")
+                    st.code(code["python_skeleton"], language="python")
 
     # ── Knowledge Graph ──────────────────────────────────────────────────────
     with st.expander("🕸️ Knowledge Graph"):

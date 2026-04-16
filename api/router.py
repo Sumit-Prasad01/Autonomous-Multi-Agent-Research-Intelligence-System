@@ -40,6 +40,7 @@ from src.research_intelligence_system.database.paper_repository import (
     get_paper_analyses, get_paper_analysis,
     get_comparison, get_literature_review,
 )
+from src.research_intelligence_system.database.paper_repository import get_paper_code
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger   = get_logger(__name__)
@@ -344,6 +345,22 @@ async def analysis_status(
 ):
     return _analysis_status.get(chat_id, {"status": "not_started", "error": None})
 
+async def _get_code_safe(db, paper_id: str) -> dict:
+    try:
+        code = await get_paper_code(db, paper_id)
+        if not code:
+            return {}
+        return {
+            "algorithm_steps":  code.algorithm_steps,
+            "pseudocode":       code.pseudocode,
+            "python_skeleton":  code.python_skeleton,
+            "time_complexity":  code.time_complexity,
+            "space_complexity": code.space_complexity,
+            "key_components":   code.key_components,
+        }
+    except Exception:
+        return {}
+
 
 @router.get("/chats/{chat_id}/analysis")
 async def get_analysis(
@@ -360,27 +377,30 @@ async def get_analysis(
     if not analyses:
         raise HTTPException(404, "No analysis found. Run 'Get Analysis' first.")
 
-    # fetch comparison + literature review
-    comparison   = await get_comparison(db, chat_id)
-    lit_review   = await get_literature_review(db, chat_id)
+    comparison = await get_comparison(db, chat_id)
+    lit_review = await get_literature_review(db, chat_id)
+
+    # build papers list with await for code (can't use await in list comprehension)
+    paper_list = []
+    for a in analyses:
+        code = await _get_code_safe(db, str(a.id))
+        paper_list.append({
+            "paper_id":          str(a.id),
+            "filename":          a.filename,
+            "status":            a.analysis_status,
+            "entities":          a.entities,
+            "summaries":         a.summaries,
+            "refined_summary":   a.refined_summary,
+            "quality_score":     a.quality_score,
+            "research_gaps":     a.research_gaps,
+            "future_directions": a.future_directions,
+            "triples":           a.triples,
+            "similar_papers":    a.similar_papers,
+            "code":              code,
+        })
 
     return {
-        "papers": [
-            {
-                "paper_id":          str(a.id),
-                "filename":          a.filename,
-                "status":            a.analysis_status,
-                "entities":          a.entities,
-                "summaries":         a.summaries,
-                "refined_summary":   a.refined_summary,
-                "quality_score":     a.quality_score,
-                "research_gaps":     a.research_gaps,
-                "future_directions": a.future_directions,
-                "triples":           a.triples,
-                "similar_papers":    a.similar_papers,
-            }
-            for a in analyses
-        ],
+        "papers": paper_list,
         "comparison": {
             "comparison_table":  comparison.comparison_table  if comparison else {},
             "ranking":           comparison.ranking           if comparison else [],

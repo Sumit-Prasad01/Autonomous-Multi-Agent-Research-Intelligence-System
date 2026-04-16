@@ -33,6 +33,8 @@ from src.research_intelligence_system.database.paper_repository import (
         get_paper_analyses, save_comparison, save_literature_review
     )
 from src.research_intelligence_system.agents.literature_review_agent import LiteratureReviewAgent
+from src.research_intelligence_system.agents.paper2code_agent import Paper2CodeAgent
+from src.research_intelligence_system.database.paper_repository import save_paper_code
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -176,6 +178,15 @@ async def _run_single_paper(
 
         await set_analysis_status(db, paper_id, "complete")
         logger.info(f"[ORCHESTRATOR] paper_id={paper_id} complete")
+
+        # ── Stage 10: Paper2Code ──────────────────────────────────────────────
+        logger.info(f"[ORCHESTRATOR] paper2code paper_id={paper_id}")
+        try:
+            code_agent  = Paper2CodeAgent(llm_id=llm_id)
+            code_result = await code_agent.generate(paper_id, sections_text, entities)
+            await save_paper_code(db, paper_id, chat_id, code_result)
+        except Exception as e:
+            logger.warning(f"[ORCHESTRATOR] paper2code failed (non-fatal): {e}")
 
         return {
             "paper_id":       paper_id,

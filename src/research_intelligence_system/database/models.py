@@ -130,6 +130,9 @@ class PaperAnalysis(Base):
     chat     = relationship("Chat", back_populates="paper_analyses")
     triples_rel = relationship("KnowledgeTriple", back_populates="paper",
                                cascade="all, delete-orphan")
+    
+    code_rel    = relationship("PaperCode", back_populates="paper",
+                           cascade="all, delete-orphan", uselist=False)
 
     __table_args__ = (
         Index("ix_paper_chat", "chat_id"),
@@ -206,3 +209,18 @@ class LiteratureReview(Base):
     __table_args__ = (
         Index("ix_litreview_chat", "chat_id"),
     )
+
+class PaperCode(Base):
+    __tablename__ = "paper_codes"
+    id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    paper_id         = Column(UUID(as_uuid=True), ForeignKey("paper_analyses.id", ondelete="CASCADE"), nullable=False, index=True)
+    chat_id          = Column(UUID(as_uuid=True), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
+    algorithm_steps  = Column(JSON, default=list)
+    pseudocode       = Column(Text, default="")
+    python_skeleton  = Column(Text, default="")
+    time_complexity  = Column(String(200), default="")
+    space_complexity = Column(String(200), default="")
+    key_components   = Column(JSON, default=list)
+    created_at       = Column(DateTime(timezone=True), server_default=func.now())
+    paper = relationship("PaperAnalysis", back_populates="code_rel")
+    __table_args__ = (Index("ix_papercode_paper", "paper_id"),)

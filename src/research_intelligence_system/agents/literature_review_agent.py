@@ -136,6 +136,13 @@ def _generate_review_node(state: LitReviewState) -> LitReviewState:
     for i, a in enumerate(analyses, 1):
         entities = a.entities or {}
         gaps     = a.research_gaps or []
+
+        # handle gaps as dicts or strings
+        gaps_text = "; ".join([
+            g["gap"] if isinstance(g, dict) else g
+            for g in gaps[:3]
+        ])
+
         papers_text += f"""
 Paper {i}: {a.filename or f'Paper {i}'}
 Summary:          {(a.refined_summary or '')[:400]}
@@ -144,7 +151,7 @@ Datasets:         {', '.join(entities.get('datasets', [])[:6])}
 Metrics:          {', '.join(entities.get('metrics',  [])[:6])}
 Methods:          {', '.join(entities.get('methods',  [])[:6])}
 Quality Score:    {a.quality_score or 0:.1f}/10
-Research Gaps:    {'; '.join(gaps[:3])}
+Research Gaps:    {gaps_text}
 ---"""
 
     # format comparison for prompt
@@ -153,9 +160,15 @@ Research Gaps:    {'; '.join(gaps[:3])}
         comp_text = f"Evolution trends: {comparison.get('evolution_trends', '')[:300]}\n"
         comp_text += f"Positioning: {comparison.get('positioning', '')[:300]}"
 
+    # handle themes as dicts or strings
+    themes_text = "\n".join([
+        f"- {t['gap'] if isinstance(t, dict) else t}"
+        for t in themes
+    ])
+
     prompt = _REVIEW_PROMPT.format(
         papers_text = papers_text[:4000],
-        themes      = "\n".join([f"- {t}" for t in themes]),
+        themes      = themes_text,
         comparison  = comp_text or "No comparison data available.",
     )
 
@@ -168,9 +181,7 @@ Research Gaps:    {'; '.join(gaps[:3])}
         if not json_match:
             raise ValueError("No JSON in review response")
         cleaned = json_match.group()
-        # remove control characters that break json.loads
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
-        # replace actual newlines inside strings with space
         cleaned = re.sub(r'\n', ' ', cleaned)
         cleaned = re.sub(r'\r', ' ', cleaned)
         result  = json.loads(cleaned)
