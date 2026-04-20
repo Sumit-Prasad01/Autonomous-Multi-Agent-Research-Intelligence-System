@@ -102,6 +102,11 @@ class PaperAnalysis(Base):
     missing_entities   = Column(JSON, default=list)
     critic_validated   = Column(Boolean, default=False)
 
+    #Hallucination Detection
+    hallucination_score  = Column(Float, default=0.0)
+    faithfulness_score   = Column(Float, default=1.0)
+    hallucinated_sentences = Column(JSON, default=list)
+
     # Stage 6 — Triples (stored here as JSON, also in Neo4j)
     triples     = Column(JSON, default=list)
     # [(subject, relation, object), ...]

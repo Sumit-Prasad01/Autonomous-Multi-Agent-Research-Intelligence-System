@@ -158,7 +158,6 @@ def _critic_node(state: CriticState) -> CriticState:
                 "feedback":         "Parse error — accepted as-is",
             }
 
-        evaluation       = json.loads(json_match.group())
         quality_score    = float(evaluation.get("quality_score", 5.0))
         missing_entities = evaluation.get("missing_entities", [])
         inconsistencies  = evaluation.get("inconsistencies", [])

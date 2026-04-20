@@ -219,3 +219,18 @@ async def get_literature_review(
         .order_by(LiteratureReview.created_at.desc())
     )
 
+
+# ── SaveHallucination ──────────────────────────────────────────────────────────
+async def save_hallucination(
+    db: AsyncSession,
+    paper_id: str,
+    hallucination_score: float,
+    faithfulness_score: float,
+    hallucinated_sentences: list,
+) -> None:
+    await update_paper_analysis(
+        db, paper_id,
+        hallucination_score     = hallucination_score,
+        faithfulness_score      = faithfulness_score,
+        hallucinated_sentences  = hallucinated_sentences,
+    )

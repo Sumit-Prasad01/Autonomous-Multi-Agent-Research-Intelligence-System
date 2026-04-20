@@ -30,6 +30,10 @@ from src.research_intelligence_system.rag.vector_store import _store
 from src.research_intelligence_system.tools.arxiv_service import ArxivService
 from src.research_intelligence_system.utils.logger import get_logger
 from qdrant_client.models import FieldCondition, Filter, MatchValue
+from src.research_intelligence_system.agents.hallucination_detector import (
+                compute_hallucination_score, save_hallucination
+            )
+from src.research_intelligence_system.database.paper_repository import save_hallucination
 
 logger = get_logger(__name__)
 
@@ -161,6 +165,27 @@ async def _run_single_paper(
             missing_entities = critic_result["missing_entities"],
             critic_validated = critic_result["critic_validated"],
         )
+        # ── Stage 5b: Hallucination Detection ────────────────────────────────
+        logger.info(f"[ORCHESTRATOR] hallucination detection paper_id={paper_id}")
+        try:
+            
+            chunks = list(sections_text.values())
+            hall_result = await compute_hallucination_score(
+                summary = critic_result["refined_summary"],
+                chunks  = chunks,
+            )
+            await save_hallucination(
+                db, paper_id,
+                hallucination_score     = hall_result["hallucination_score"],
+                faithfulness_score      = hall_result["faithfulness_score"],
+                hallucinated_sentences  = hall_result["hallucinated_sentences"],
+            )
+            logger.info(
+                f"[HALLUCINATION] score={hall_result['hallucination_score']:.2f} "
+                f"faithfulness={hall_result['faithfulness_score']:.2f}"
+            )
+        except Exception as e:
+            logger.warning(f"[ORCHESTRATOR] hallucination detection failed (non-fatal): {e}")
 
         # ── Stage 6: Triple Extraction ────────────────────────────────────────
         logger.info(f"[ORCHESTRATOR] triples paper_id={paper_id}")

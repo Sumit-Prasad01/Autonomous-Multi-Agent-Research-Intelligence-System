@@ -378,6 +378,9 @@ async def get_analysis(
             "future_directions": a.future_directions,
             "triples":           a.triples,
             "similar_papers":    a.similar_papers,
+            "hallucination_score":     a.hallucination_score,
+            "faithfulness_score":      a.faithfulness_score,
+            "hallucinated_sentences":  a.hallucinated_sentences,
         })
 
     return {
