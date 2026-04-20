@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.research_intelligence_system.database.models import (
     KnowledgeTriple, LiteratureReview, PaperAnalysis, PaperComparison
 )
-from src.research_intelligence_system.database.models import PaperCode
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -220,22 +219,3 @@ async def get_literature_review(
         .order_by(LiteratureReview.created_at.desc())
     )
 
-# ── Paper2Code ──────────────────────────────────────────────────────────
-async def save_paper_code(db, paper_id, chat_id, code_result) -> None:
-    code = PaperCode(
-        paper_id         = uuid.UUID(paper_id),
-        chat_id          = uuid.UUID(chat_id),
-        algorithm_steps  = code_result.get("algorithm_steps", []),
-        pseudocode       = code_result.get("pseudocode", ""),
-        python_skeleton  = code_result.get("python_skeleton", ""),
-        time_complexity  = code_result.get("time_complexity", ""),
-        space_complexity = code_result.get("space_complexity", ""),
-        key_components   = code_result.get("key_components", []),
-    )
-    db.add(code)
-    await db.commit()
-
-async def get_paper_code(db, paper_id) -> Optional[Any]:
-    return await db.scalar(
-        select(PaperCode).where(PaperCode.paper_id == uuid.UUID(paper_id))
-    )

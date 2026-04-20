@@ -11,46 +11,95 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, StateGraph
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.research_intelligence_system.agents.extraction_agent import (
-    ExtractionAgent, get_sections_from_chunks
-)
-from src.research_intelligence_system.agents.summarizer_agent import SummarizerAgent
+from src.research_intelligence_system.agents.comparison_agent import ComparisonAgent
 from src.research_intelligence_system.agents.critic_agent import CriticAgent
-from src.research_intelligence_system.knowledge_graph.triple_extractor import TripleExtractor
+from src.research_intelligence_system.agents.extraction_agent import ExtractionAgent
+from src.research_intelligence_system.agents.gap_detection_agent import GapDetectionAgent
+from src.research_intelligence_system.agents.literature_review_agent import LiteratureReviewAgent
+from src.research_intelligence_system.agents.summarizer_agent import SummarizerAgent
+from src.research_intelligence_system.constants import COLLECTION_NAME
 from src.research_intelligence_system.database.paper_repository import (
-    get_paper_analysis, save_entities, save_summaries,
-    save_critic_output, save_triples, save_similar_papers,
-    save_gaps, set_analysis_status,
+    get_paper_analyses, get_paper_analysis,
+    save_comparison, save_critic_output, save_entities,
+    save_gaps, save_literature_review, save_similar_papers,
+    save_summaries, save_triples, set_analysis_status,
 )
 from src.research_intelligence_system.knowledge_graph.graph_builder import GraphBuilder
-from src.research_intelligence_system.agents.gap_detection_agent import GapDetectionAgent
-from src.research_intelligence_system.tools.arxiv_service import ArxivService
+from src.research_intelligence_system.knowledge_graph.triple_extractor import TripleExtractor
 from src.research_intelligence_system.rag.vector_store import _store
-from qdrant_client.models import Filter, FieldCondition, MatchValue
-from src.research_intelligence_system.constants import COLLECTION_NAME
-from src.research_intelligence_system.agents.comparison_agent import ComparisonAgent
-from src.research_intelligence_system.database.paper_repository import (
-        get_paper_analyses, save_comparison, save_literature_review
-    )
-from src.research_intelligence_system.agents.literature_review_agent import LiteratureReviewAgent
-from src.research_intelligence_system.agents.paper2code_agent import Paper2CodeAgent
-from src.research_intelligence_system.database.paper_repository import save_paper_code
+from src.research_intelligence_system.tools.arxiv_service import ArxivService
 from src.research_intelligence_system.utils.logger import get_logger
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 logger = get_logger(__name__)
 
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+_ARXIV_DELAY   = 2    # seconds between arXiv calls to avoid 429
+_QDRANT_LIMIT  = 200  # max chunks to fetch per paper
+
+
 # ── State ─────────────────────────────────────────────────────────────────────
 class OrchestratorState(TypedDict):
-    chat_id:       str
-    paper_ids:     List[str]
-    llm_id:        str
-    paper_count:   int
-    results:       Dict[str, Any]   # paper_id → per-paper results
-    comparison:    Dict[str, Any]
-    lit_review:    Dict[str, Any]
-    errors:        List[str]
-    current_step:  str
+    chat_id:      str
+    paper_ids:    List[str]
+    llm_id:       str
+    paper_count:  int
+    results:      Dict[str, Any]
+    comparison:   Dict[str, Any]
+    lit_review:   Dict[str, Any]
+    errors:       List[str]
+    current_step: str
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+async def _fetch_sections(chat_id: str) -> Dict[str, str]:
+    """
+    Fetch paper chunks from Qdrant and group by section.
+    Returns {section_name: joined_text} truncated to 3000 chars each.
+    """
+    results, _ = _store.client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=Filter(must=[FieldCondition(
+            key="metadata.chat_id",
+            match=MatchValue(value=chat_id),
+        )]),
+        limit=_QDRANT_LIMIT,
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    sections: Dict[str, List[str]] = {
+        "abstract": [], "introduction": [], "methodology": [],
+        "results":  [], "conclusion":   [], "body":        [],
+    }
+
+    for point in results:
+        payload = point.payload or {}
+        section = payload.get("metadata", {}).get("section", "body")
+        content = payload.get("page_content", "")
+        if content:
+            sections.setdefault(section, []).append(content)
+
+    return {k: " ".join(v)[:3000] for k, v in sections.items() if v}
+
+
+async def _fetch_similar_papers(
+    entities: Dict[str, Any],
+    filename: str,
+) -> List[Dict]:
+    """Fetch similar papers from arXiv using entity-based query."""
+    try:
+        arxiv   = ArxivService()
+        title   = entities.get("title", "")
+        methods = list(dict.fromkeys(entities.get("methods", [])[:3]))
+        query   = f"{title} {' '.join(methods)}".strip()
+        similar = await arxiv.search(query, max_results=5)
+        await asyncio.sleep(_ARXIV_DELAY)
+        return similar
+    except Exception as e:
+        logger.warning(f"[ORCHESTRATOR] arXiv search failed (non-fatal): {e}")
+        return []
 
 
 # ── Per-paper pipeline ────────────────────────────────────────────────────────
@@ -61,65 +110,50 @@ async def _run_single_paper(
     db:       AsyncSession,
 ) -> Dict[str, Any]:
     """
-    Run full agent pipeline for a single paper:
-    extraction → summarization → critic → triples
+    Full per-paper agent pipeline:
+    Stage 3: Entity extraction
+    Stage 4: Two-stage summarization (BART + LLM)
+    Stage 5: Critic self-reflection
+    Stage 6: Triple extraction
+    Stage 7: Neo4j graph construction
+    Stage 8: Similar papers (arXiv)
+    Stage 9: Research gap detection
     """
     logger.info(f"[ORCHESTRATOR] starting paper_id={paper_id}")
     await set_analysis_status(db, paper_id, "running")
 
     try:
-        # ── fetch paper from DB ───────────────────────────────────────────────
+        # validate paper exists
         paper = await get_paper_analysis(db, paper_id)
         if not paper:
             raise ValueError(f"PaperAnalysis not found: {paper_id}")
 
-        # ── fetch chunks from Qdrant to get sections ──────────────────────────
-        results, _ = _store.client.scroll(
-            collection_name=COLLECTION_NAME,
-            scroll_filter=Filter(must=[FieldCondition(
-                key="metadata.chat_id",
-                match=MatchValue(value=chat_id),
-            )]),
-            limit=200,
-            with_payload=True,
-            with_vectors=False,
-        )
-
-        # build sections dict from Qdrant payloads
-        sections: Dict[str, List[str]] = {
-            "abstract": [], "introduction": [], "methodology": [],
-            "results":  [], "conclusion":   [], "body": [],
-        }
-        for point in results:
-            payload = point.payload or {}
-            section = payload.get("metadata", {}).get("section", "body")
-            content = payload.get("page_content", "")
-            if content:
-                sections.setdefault(section, []).append(content)
-
-        sections_text = {k: " ".join(v)[:3000] for k, v in sections.items() if v}
-
+        # fetch sections from Qdrant
+        sections_text = await _fetch_sections(chat_id)
         if not sections_text:
             raise ValueError(f"No sections found in Qdrant for chat_id={chat_id}")
 
         # ── Stage 3: Entity Extraction ────────────────────────────────────────
         logger.info(f"[ORCHESTRATOR] extraction paper_id={paper_id}")
-        extraction_agent = ExtractionAgent(llm_id=llm_id)
-        entities = await extraction_agent.extract(paper_id, sections_text)
+        entities = await ExtractionAgent(llm_id=llm_id).extract(paper_id, sections_text)
         await save_entities(db, paper_id, entities)
 
-        # ── Stage 4: Summarization (two-stage: BART + LLM synthesis) ───────────
+        # ── Stage 4: Two-stage Summarization ─────────────────────────────────
         logger.info(f"[ORCHESTRATOR] summarization paper_id={paper_id}")
-        summarizer_agent = SummarizerAgent(llm_id=llm_id)
-        summaries = await summarizer_agent.summarize(paper_id, sections_text, entities)
+        summaries = await SummarizerAgent(llm_id=llm_id).summarize(
+            paper_id, sections_text, entities
+        )
         await save_summaries(db, paper_id, summaries)
 
-        # ── Stage 5: Critic ───────────────────────────────────────────────────
+        # ── Stage 5: Critic Self-reflection ──────────────────────────────────
         logger.info(f"[ORCHESTRATOR] critic paper_id={paper_id}")
-        critic_agent = CriticAgent(llm_id=llm_id)
-        # pass comprehensive summary to critic for better evaluation
-        critic_summaries = {**summaries, "overall": summaries.get("comprehensive", summaries.get("overall", ""))}
-        critic_result = await critic_agent.evaluate(paper_id, critic_summaries, entities)
+        critic_summaries = {
+            **summaries,
+            "overall": summaries.get("comprehensive", summaries.get("overall", "")),
+        }
+        critic_result = await CriticAgent(llm_id=llm_id).evaluate(
+            paper_id, critic_summaries, entities
+        )
         await save_critic_output(
             db, paper_id,
             refined_summary  = critic_result["refined_summary"],
@@ -130,37 +164,30 @@ async def _run_single_paper(
 
         # ── Stage 6: Triple Extraction ────────────────────────────────────────
         logger.info(f"[ORCHESTRATOR] triples paper_id={paper_id}")
-        triple_extractor = TripleExtractor(llm_id=llm_id)
-        triples = await triple_extractor.extract(paper_id, sections_text, entities)
+        triples = await TripleExtractor(llm_id=llm_id).extract(
+            paper_id, sections_text, entities
+        )
         await save_triples(db, paper_id, chat_id, triples)
 
-        # ── Stage 7: Neo4j Graph ──────────────────────────────────────────────
+        # ── Stage 7: Neo4j Graph Construction ────────────────────────────────
         logger.info(f"[ORCHESTRATOR] building graph paper_id={paper_id}")
         try:
-            graph_builder = GraphBuilder()
-            await graph_builder.build(chat_id, paper_id, entities, triples)
+            await GraphBuilder().build(
+                chat_id, paper_id, entities, triples,
+                filename=paper.filename or "",
+            )
         except Exception as e:
             logger.warning(f"[ORCHESTRATOR] graph build failed (non-fatal): {e}")
 
         # ── Stage 8: Similar Papers (arXiv) ──────────────────────────────────
         logger.info(f"[ORCHESTRATOR] fetching similar papers paper_id={paper_id}")
-        try:
-            arxiv   = ArxivService()
-            title   = entities.get("title", "")
-            methods = entities.get("methods", [])[:3]
-            query   = f"{title} {' '.join(methods)}".strip()
-            similar = await arxiv.search(query, max_results=5)
-            await save_similar_papers(db, paper_id, similar)
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.warning(f"[ORCHESTRATOR] arXiv search failed (non-fatal): {e}")
-            similar = []
+        similar = await _fetch_similar_papers(entities, paper.filename or "")
+        await save_similar_papers(db, paper_id, similar)
 
-        # ── Stage 9: Gap Detection ────────────────────────────────────────────
+        # ── Stage 9: Research Gap Detection ──────────────────────────────────
         logger.info(f"[ORCHESTRATOR] gap detection paper_id={paper_id}")
         try:
-            gap_agent = GapDetectionAgent(llm_id=llm_id)
-            gap_result = await gap_agent.detect(
+            gap_result = await GapDetectionAgent(llm_id=llm_id).detect(
                 chat_id=chat_id,
                 paper_id=paper_id,
                 entities=entities,
@@ -179,22 +206,13 @@ async def _run_single_paper(
         await set_analysis_status(db, paper_id, "complete")
         logger.info(f"[ORCHESTRATOR] paper_id={paper_id} complete")
 
-        # ── Stage 10: Paper2Code ──────────────────────────────────────────────
-        logger.info(f"[ORCHESTRATOR] paper2code paper_id={paper_id}")
-        try:
-            code_agent  = Paper2CodeAgent(llm_id=llm_id)
-            code_result = await code_agent.generate(paper_id, sections_text, entities)
-            await save_paper_code(db, paper_id, chat_id, code_result)
-        except Exception as e:
-            logger.warning(f"[ORCHESTRATOR] paper2code failed (non-fatal): {e}")
-
         return {
-            "paper_id":       paper_id,
-            "entities":       entities,
-            "summaries":      summaries,
-            "critic_result":  critic_result,
-            "triples":        triples,
-            "status":         "complete",
+            "paper_id":      paper_id,
+            "entities":      entities,
+            "summaries":     summaries,
+            "critic_result": critic_result,
+            "triples":       triples,
+            "status":        "complete",
         }
 
     except Exception as e:
@@ -203,26 +221,19 @@ async def _run_single_paper(
         return {"paper_id": paper_id, "status": "failed", "error": str(e)}
 
 
-# ── Orchestrator LangGraph nodes ──────────────────────────────────────────────
+# ── Orchestrator nodes ────────────────────────────────────────────────────────
 def _detect_task_node(state: OrchestratorState) -> OrchestratorState:
-    """Stage 0 — detect task type based on paper count."""
-    paper_count = len(state["paper_ids"])
-    task        = "full_analysis"
-
-    if paper_count == 1:
-        task = "single_paper_with_web"
-    elif paper_count >= 2:
-        task = "multi_paper_comparison"
-
-    logger.info(f"[ORCHESTRATOR] task={task} papers={paper_count}")
-    return {
-        **state,
-        "paper_count":  paper_count,
-        "current_step": task,
-    }
+    """Detect task type based on paper count."""
+    count = len(state["paper_ids"])
+    task  = "single_paper_with_web" if count == 1 else "multi_paper_comparison"
+    logger.info(f"[ORCHESTRATOR] task={task} papers={count}")
+    return {**state, "paper_count": count, "current_step": task}
 
 
-async def _run_per_paper_node(state: OrchestratorState, db: AsyncSession) -> OrchestratorState:
+async def _run_per_paper_node(
+    state: OrchestratorState,
+    db:    AsyncSession,
+) -> OrchestratorState:
     """Run all per-paper agents in parallel across all papers."""
     logger.info(f"[ORCHESTRATOR] running {state['paper_count']} papers in parallel")
 
@@ -241,22 +252,24 @@ async def _run_per_paper_node(state: OrchestratorState, db: AsyncSession) -> Orc
     for r in results_list:
         if isinstance(r, Exception):
             errors.append(str(r))
-        else:
+        elif r.get("status") != "failed":
             results[r["paper_id"]] = r
 
     return {**state, "results": results, "errors": errors}
 
 
-async def _run_comparison_node(state: OrchestratorState, db: AsyncSession) -> OrchestratorState:
-    """Stage 11 — comparison agent (web-augmented or direct)."""
+async def _run_comparison_node(
+    state: OrchestratorState,
+    db:    AsyncSession,
+) -> OrchestratorState:
+    """Cross-paper comparison — web-augmented or direct."""
     logger.info(f"[ORCHESTRATOR] comparison type={state['current_step']}")
     try:
         analyses   = await get_paper_analyses(db, state["chat_id"])
-        comp_agent = ComparisonAgent(llm_id=state["llm_id"])
-        comparison = await comp_agent.compare(
-            chat_id       = state["chat_id"],
-            paper_analyses= analyses,
-            use_web       = len(analyses) == 1,
+        comparison = await ComparisonAgent(llm_id=state["llm_id"]).compare(
+            chat_id        = state["chat_id"],
+            paper_analyses = analyses,
+            use_web        = len(analyses) == 1,
         )
         await save_comparison(
             db,
@@ -276,16 +289,18 @@ async def _run_comparison_node(state: OrchestratorState, db: AsyncSession) -> Or
         return {**state, "comparison": {}}
 
 
-async def _run_literature_review_node(state: OrchestratorState, db: AsyncSession) -> OrchestratorState:
-    """Stage 12 — literature review agent."""
+async def _run_literature_review_node(
+    state: OrchestratorState,
+    db:    AsyncSession,
+) -> OrchestratorState:
+    """Generate literature review from all paper analyses."""
     logger.info("[ORCHESTRATOR] literature review")
     try:
         analyses   = await get_paper_analyses(db, state["chat_id"])
-        lit_agent  = LiteratureReviewAgent(llm_id=state["llm_id"])
-        lit_review = await lit_agent.generate(
-            chat_id   = state["chat_id"],
-            analyses  = analyses,
-            comparison= state.get("comparison", {}),
+        lit_review = await LiteratureReviewAgent(llm_id=state["llm_id"]).generate(
+            chat_id    = state["chat_id"],
+            analyses   = analyses,
+            comparison = state.get("comparison", {}),
         )
         await save_literature_review(
             db,
@@ -317,14 +332,18 @@ class OrchestratorAgent:
         db:        AsyncSession,
     ) -> Dict[str, Any]:
         """
-        Full pipeline:
-        1. Detect task
-        2. Run per-paper agents in parallel
-        3. Run comparison agent
-        4. Run literature review agent
-        5. Return all results
+        Full analysis pipeline:
+          0. Detect task type
+          3-9. Per-paper agents (parallel)
+          11. Cross-paper comparison
+          12. Literature review
+
+        Returns: {results, comparison, lit_review, errors}
         """
-        logger.info(f"[ORCHESTRATOR] full analysis chat_id={chat_id} papers={len(paper_ids)}")
+        logger.info(
+            f"[ORCHESTRATOR] full analysis "
+            f"chat_id={chat_id} papers={len(paper_ids)}"
+        )
 
         state: OrchestratorState = {
             "chat_id":      chat_id,
@@ -338,19 +357,15 @@ class OrchestratorAgent:
             "current_step": "init",
         }
 
-        # Stage 0 — detect task
         state = _detect_task_node(state)
-
-        # Stage 3-9 — per-paper agents (parallel)
         state = await _run_per_paper_node(state, db)
-
-        # Stage 11 — comparison
         state = await _run_comparison_node(state, db)
-
-        # Stage 12 — literature review
         state = await _run_literature_review_node(state, db)
 
-        logger.info(f"[ORCHESTRATOR] all done chat_id={chat_id} errors={state['errors']}")
+        logger.info(
+            f"[ORCHESTRATOR] all done "
+            f"chat_id={chat_id} errors={state['errors']}"
+        )
 
         return {
             "results":    state["results"],

@@ -40,7 +40,6 @@ from src.research_intelligence_system.database.paper_repository import (
     get_paper_analyses, get_paper_analysis,
     get_comparison, get_literature_review,
 )
-from src.research_intelligence_system.database.paper_repository import get_paper_code
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger   = get_logger(__name__)
@@ -345,22 +344,6 @@ async def analysis_status(
 ):
     return _analysis_status.get(chat_id, {"status": "not_started", "error": None})
 
-async def _get_code_safe(db, paper_id: str) -> dict:
-    try:
-        code = await get_paper_code(db, paper_id)
-        if not code:
-            return {}
-        return {
-            "algorithm_steps":  code.algorithm_steps,
-            "pseudocode":       code.pseudocode,
-            "python_skeleton":  code.python_skeleton,
-            "time_complexity":  code.time_complexity,
-            "space_complexity": code.space_complexity,
-            "key_components":   code.key_components,
-        }
-    except Exception:
-        return {}
-
 
 @router.get("/chats/{chat_id}/analysis")
 async def get_analysis(
@@ -383,7 +366,6 @@ async def get_analysis(
     # build papers list with await for code (can't use await in list comprehension)
     paper_list = []
     for a in analyses:
-        code = await _get_code_safe(db, str(a.id))
         paper_list.append({
             "paper_id":          str(a.id),
             "filename":          a.filename,
@@ -396,7 +378,6 @@ async def get_analysis(
             "future_directions": a.future_directions,
             "triples":           a.triples,
             "similar_papers":    a.similar_papers,
-            "code":              code,
         })
 
     return {
