@@ -54,7 +54,9 @@ RESULTS: {results}
 
 CONCLUSION: {conclusion}
 
-Return only the JSON object, no explanation."""
+CRITICAL: Your response must start with {{ and end with }}. 
+No text before or after. No markdown. No explanation. Pure JSON only.
+"""
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────

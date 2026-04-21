@@ -74,6 +74,7 @@ def _compute_hallucination_sync(
         model = CrossEncoder(
             "BAAI/bge-reranker-base",
             local_files_only=True,
+            device="cuda"
         )
     except Exception as e:
         logger.warning(f"[HALLUCINATION] cross-encoder load failed: {e}")

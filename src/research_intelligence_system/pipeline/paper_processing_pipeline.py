@@ -92,7 +92,9 @@ async def _create_paper_analysis(
 ) -> str:
     """Create a pending PaperAnalysis row and return its UUID."""
     import uuid as uuid_lib
+    import re
     from src.research_intelligence_system.database.models import PaperAnalysis
+    from src.research_intelligence_system.database.chat_repository import update_chat_title
 
     file_hash = await asyncio.get_running_loop().run_in_executor(
         None, _compute_file_hash, pdf_path
@@ -110,8 +112,16 @@ async def _create_paper_analysis(
     await db.commit()
     await db.refresh(paper)
     logger.info(f"[INGEST] PaperAnalysis created id={paper.id} status=pending")
-    return str(paper.id)
 
+    # ── set chat title to cleaned PDF filename ────────────────────────────
+    clean = re.sub(r'^[a-f0-9]{32}_', '', filename)  # strip MD5 prefix
+    clean = re.sub(r'\.pdf$', '', clean, flags=re.IGNORECASE)
+    clean = clean.replace("_", " ").replace("-", " ").strip()
+    if clean:
+        await update_chat_title(db, chat_id, clean[:100])
+        logger.info(f"[INGEST] chat title set to '{clean[:100]}'")
+
+    return str(paper.id)
 
 async def ingest_multiple(
     chat_id: str,

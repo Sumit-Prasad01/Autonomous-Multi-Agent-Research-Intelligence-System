@@ -68,10 +68,6 @@ async def process_chat(
 
     logger.info(f"[CHAT] chat_id={chat_id} query={user_message!r}")
 
-    # update title BEFORE pushing to memory so not memory check is accurate
-    if not memory:
-        await update_chat_title(db, chat_id, user_message[:60])
-
     await asyncio.gather(
         push_message(chat_id, "user", user_message),
         save_message(db, chat_id, "user", user_message),
@@ -112,10 +108,6 @@ async def stream_chat(
     memory  = await get_memory(chat_id)
     history = _build_history(memory)
     query   = _build_query(history, user_message)
-
-    # update title on first message
-    if not memory:
-        await update_chat_title(db, chat_id, user_message[:60])
 
     await asyncio.gather(
         push_message(chat_id, "user", user_message),

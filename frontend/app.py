@@ -392,10 +392,6 @@ for msg in chat["messages"]:
 user_input = st.chat_input("Ask anything about your research paper …")
 
 if user_input:
-    if not chat["messages"]:
-        chat["title"] = user_input[:40]
-        st.session_state.chats[cid]["title"] = user_input[:40]
-
     chat["messages"].append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)

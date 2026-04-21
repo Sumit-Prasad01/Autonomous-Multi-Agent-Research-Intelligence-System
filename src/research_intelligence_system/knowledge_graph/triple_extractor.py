@@ -30,7 +30,7 @@ class TripleState(TypedDict):
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 def _get_llm(llm_id: str) -> ChatGroq:
-    return ChatGroq(model=llm_id, temperature=0)
+    return ChatGroq(model=llm_id, temperature=0, max_tokens = 2000)
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
