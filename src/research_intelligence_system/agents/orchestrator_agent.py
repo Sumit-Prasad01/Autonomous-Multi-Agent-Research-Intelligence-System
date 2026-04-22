@@ -195,6 +195,24 @@ async def _run_single_paper(
         )
         await save_triples(db, paper_id, chat_id, triples)
 
+        # ── Stage 6b: Triple Faithfulness Filter ─────────────────────────────
+        logger.info(f"[ORCHESTRATOR] triple faithfulness filter paper_id={paper_id}")
+        try:
+            from src.research_intelligence_system.agents.hallucination_detector import (
+                filter_triples_by_faithfulness
+            )
+            chunks = list(sections_text.values())
+            triple_result = await filter_triples_by_faithfulness(triples, chunks)
+            triples = triple_result["filtered_triples"]
+            logger.info(
+                f"[TRIPLE FILTER] kept={triple_result['kept_count']} "
+                f"removed={triple_result['removed_count']}"
+            )
+            # re-save filtered triples
+            await save_triples(db, paper_id, chat_id, triples)
+        except Exception as e:
+            logger.warning(f"[ORCHESTRATOR] triple filter failed (non-fatal): {e}")
+
         # ── Stage 7: Neo4j Graph Construction ────────────────────────────────
         logger.info(f"[ORCHESTRATOR] building graph paper_id={paper_id}")
         try:
@@ -228,6 +246,31 @@ async def _run_single_paper(
             )
         except Exception as e:
             logger.warning(f"[ORCHESTRATOR] gap detection failed (non-fatal): {e}")
+        
+        # ── Stage 9b: Gap Evidence Faithfulness ──────────────────────────────
+        logger.info(f"[ORCHESTRATOR] gap evidence scoring paper_id={paper_id}")
+        try:
+            from src.research_intelligence_system.agents.hallucination_detector import (
+                score_gap_evidence
+            )
+            chunks = list(sections_text.values())
+            gap_scored = await score_gap_evidence(
+                gap_result["research_gaps"], chunks
+            )
+            gap_result["research_gaps"] = gap_scored["scored_gaps"]
+            logger.info(
+                f"[GAP FILTER] low_confidence={gap_scored['low_confidence_count']}"
+            )
+            # re-save with evidence scores
+            await save_gaps(
+                db, paper_id,
+                research_gaps     = gap_result["research_gaps"],
+                missing_edges     = gap_result["missing_edges"],
+                future_directions = gap_result["future_directions"],
+                novelty_score     = gap_result["novelty_score"],
+            )
+        except Exception as e:
+            logger.warning(f"[ORCHESTRATOR] gap scoring failed (non-fatal): {e}")
 
         await set_analysis_status(db, paper_id, "complete")
         logger.info(f"[ORCHESTRATOR] paper_id={paper_id} complete")
