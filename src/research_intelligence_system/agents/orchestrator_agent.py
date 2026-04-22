@@ -90,13 +90,17 @@ async def _fetch_similar_papers(
     entities: Dict[str, Any],
     filename: str,
 ) -> List[Dict]:
-    """Fetch similar papers from arXiv using entity-based query."""
+    """Fetch similar papers using entity-based query — not filename."""
     try:
         arxiv   = ArxivService()
-        title   = entities.get("title", "")
-        methods = list(dict.fromkeys(entities.get("methods", [])[:3]))
-        query   = f"{title} {' '.join(methods)}".strip()
-        similar = await arxiv.search(query, max_results=5)
+        similar = await arxiv.search_by_entities(
+            models   = entities.get("models",   []),
+            datasets = entities.get("datasets", []),
+            methods  = entities.get("methods",  []),
+            tasks    = entities.get("tasks",    []),
+            title    = entities.get("title", filename or ""),
+            max_results = 5,
+        )
         await asyncio.sleep(_ARXIV_DELAY)
         return similar
     except Exception as e:

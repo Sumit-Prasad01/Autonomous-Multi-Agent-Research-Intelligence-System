@@ -33,12 +33,32 @@ class LitReviewState(TypedDict):
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 def _get_llm(llm_id: str) -> ChatGroq:
-    return ChatGroq(model=llm_id, temperature=0.3)
+    return ChatGroq(model=llm_id, temperature=0.3, max_tokens=2000)
+
+
+# ── Text cleaner ──────────────────────────────────────────────────────────────
+def _clean_text(text: str) -> str:
+    """Fix hyphenated words split mid-word and clean whitespace."""
+    text = re.sub(r'(\w+)-\s+(\w+)', r'\1\2', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
+
+
+def _parse_json_safe(raw: str) -> Dict:
+    """Extract and parse JSON from LLM response safely."""
+    json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not json_match:
+        raise ValueError("No JSON found in response")
+    cleaned = json_match.group()
+    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
+    cleaned = re.sub(r'\n', ' ', cleaned)
+    cleaned = re.sub(r'\r', ' ', cleaned)
+    return json.loads(cleaned)
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 _THEME_EXTRACTION_PROMPT = """You are a research literature analyst.
-Identify the main themes across these research papers.
+Identify the main research themes across these papers.
 
 Papers:
 {papers_summary}
@@ -46,31 +66,62 @@ Papers:
 Return ONLY valid JSON:
 {{
   "themes": [
-    "Theme 1: brief description",
-    "Theme 2: brief description",
-    "Theme 3: brief description"
+    "Theme 1: brief description of first distinct research dimension",
+    "Theme 2: brief description of second distinct research dimension",
+    "Theme 3: brief description of third distinct research dimension",
+    "Theme 4: brief description of fourth distinct research dimension"
   ]
 }}
 
-Return only JSON, no explanation."""
+Rules:
+- Generate 4-5 themes
+- Each theme must be a DISTINCT research dimension — no overlap
+- Themes should reflect actual content from the papers
+- Return only JSON, no explanation"""
 
 
-_REVIEW_PROMPT = """You are an academic writer. Write a literature review and return it as JSON.
+_REVIEW_PROMPT = """You are an academic writer generating a structured literature review.
 
-Papers:
+Papers analyzed:
 {papers_text}
 
-Themes: {themes}
+Research themes: {themes}
 
-Comparison: {comparison}
+Comparison context: {comparison}
+
+Write a structured literature review with EXACTLY 4 paragraphs separated by [PARA].
+Each paragraph must be 3+ sentences and 80+ words.
+
+Paragraph 1 - Introduction and Background:
+  Introduce the research area, its importance, and historical context.
+  Mention specific model/method names from the papers.
+
+Paragraph 2 - Thematic Analysis:
+  Analyze the main themes across the papers.
+  Compare how different papers approach the same problems.
+  Reference specific methods, datasets, and results.
+
+Paragraph 3 - Comparative Analysis:
+  Compare the contributions, strengths, and limitations of each paper.
+  Discuss how they relate to each other.
+  Include specific performance numbers or findings if available.
+
+Paragraph 4 - Future Directions:
+  Propose 4-5 SPECIFIC future research directions with concrete methodology.
+  These must be SOLUTIONS not restatements of problems.
+  Each direction must suggest a different research avenue.
+  Do NOT copy text from the Research Gaps field.
 
 CRITICAL RULES:
 - Return ONLY a JSON object
-- NO actual newline characters inside string values — use spaces instead
-- NO markdown, NO code blocks, NO explanation
+- Use [PARA] to separate paragraphs inside review_text — NOT actual newlines
+- NO markdown, NO code blocks, NO preamble
+- future_directions field: 4-5 complete sentences proposing specific research solutions
+- research_gaps_summary: exactly 3 sentences summarizing key gaps
+- Minimum 300 words total in review_text
 
-Return exactly this structure:
-{{"review_text": "Introduction: ... Thematic Analysis: ... Comparative Analysis: ... Research Gaps: ... Future Directions: ...", "research_gaps_summary": "Summary of gaps in 2 sentences.", "future_directions": "Future directions in 2 sentences.", "overall_quality": 7.5}}"""
+Return ONLY this JSON structure:
+{{"review_text": "Paragraph 1 text [PARA] Paragraph 2 text [PARA] Paragraph 3 text [PARA] Paragraph 4 text", "research_gaps_summary": "Gap sentence 1. Gap sentence 2. Gap sentence 3.", "future_directions": "Direction 1 sentence. Direction 2 sentence. Direction 3 sentence. Direction 4 sentence. Direction 5 sentence.", "overall_quality": 7.5}}"""
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -82,7 +133,6 @@ def _extract_themes_node(state: LitReviewState) -> LitReviewState:
     if not analyses:
         return {**state, "themes": [], "error": "no papers to review"}
 
-    # build paper summaries for theme extraction
     papers_summary = "\n".join([
         f"Paper {i+1} ({a.filename or 'Unknown'}):\n"
         f"  Summary: {(a.refined_summary or '')[:300]}\n"
@@ -96,19 +146,10 @@ def _extract_themes_node(state: LitReviewState) -> LitReviewState:
         response = llm.invoke(_THEME_EXTRACTION_PROMPT.format(
             papers_summary=papers_summary[:3000]
         ))
-        raw = response.content.strip()
-
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if not json_match:
-            raise ValueError("No JSON in review response")
-        cleaned = json_match.group()
-        # remove control characters that break json.loads
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
-        # replace actual newlines inside strings with space
-        cleaned = re.sub(r'\n', ' ', cleaned)
-        cleaned = re.sub(r'\r', ' ', cleaned)
-        result  = json.loads(cleaned)
+        result = _parse_json_safe(response.content.strip())
         themes = result.get("themes", [])
+        # clean hyphenation in themes
+        themes = [_clean_text(t) for t in themes if isinstance(t, str)]
 
         logger.info(f"[LIT REVIEW] extracted {len(themes)} themes")
         return {**state, "themes": themes, "error": ""}
@@ -137,30 +178,30 @@ def _generate_review_node(state: LitReviewState) -> LitReviewState:
         entities = a.entities or {}
         gaps     = a.research_gaps or []
 
-        # handle gaps as dicts or strings
         gaps_text = "; ".join([
             g["gap"] if isinstance(g, dict) else g
             for g in gaps[:3]
         ])
 
-        papers_text += f"""
-Paper {i}: {a.filename or f'Paper {i}'}
-Summary:          {(a.refined_summary or '')[:400]}
-Models:           {', '.join(entities.get('models',   [])[:6])}
-Datasets:         {', '.join(entities.get('datasets', [])[:6])}
-Metrics:          {', '.join(entities.get('metrics',  [])[:6])}
-Methods:          {', '.join(entities.get('methods',  [])[:6])}
-Quality Score:    {a.quality_score or 0:.1f}/10
-Research Gaps:    {gaps_text}
----"""
+        papers_text += (
+            f"\nPaper {i}: {a.filename or f'Paper {i}'}\n"
+            f"Summary:       {(a.refined_summary or '')[:400]}\n"
+            f"Models:        {', '.join(entities.get('models',   [])[:6])}\n"
+            f"Datasets:      {', '.join(entities.get('datasets', [])[:6])}\n"
+            f"Metrics:       {', '.join(entities.get('metrics',  [])[:6])}\n"
+            f"Methods:       {', '.join(entities.get('methods',  [])[:6])}\n"
+            f"Quality Score: {a.quality_score or 0:.1f}/10\n"
+            f"Key Gaps:      {gaps_text}\n"
+            f"---"
+        )
 
-    # format comparison for prompt
     comp_text = ""
     if comparison:
-        comp_text = f"Evolution trends: {comparison.get('evolution_trends', '')[:300]}\n"
-        comp_text += f"Positioning: {comparison.get('positioning', '')[:300]}"
+        comp_text = (
+            f"Evolution trends: {comparison.get('evolution_trends', '')[:300]}\n"
+            f"Positioning: {comparison.get('positioning', '')[:300]}"
+        )
 
-    # handle themes as dicts or strings
     themes_text = "\n".join([
         f"- {t['gap'] if isinstance(t, dict) else t}"
         for t in themes
@@ -168,7 +209,7 @@ Research Gaps:    {gaps_text}
 
     prompt = _REVIEW_PROMPT.format(
         papers_text = papers_text[:4000],
-        themes      = themes_text,
+        themes      = themes_text or "No themes extracted.",
         comparison  = comp_text or "No comparison data available.",
     )
 
@@ -177,21 +218,36 @@ Research Gaps:    {gaps_text}
         response = llm.invoke(prompt)
         raw      = response.content.strip()
 
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if not json_match:
-            raise ValueError("No JSON in review response")
-        cleaned = json_match.group()
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
-        cleaned = re.sub(r'\n', ' ', cleaned)
-        cleaned = re.sub(r'\r', ' ', cleaned)
-        result  = json.loads(cleaned)
+        result = _parse_json_safe(raw)
 
         review_text           = result.get("review_text", "")
         research_gaps_summary = result.get("research_gaps_summary", "")
         future_directions     = result.get("future_directions", "")
         overall_quality       = float(result.get("overall_quality", 7.0))
 
-        logger.info(f"[LIT REVIEW] generated {len(review_text)} chars quality={overall_quality}")
+        # convert [PARA] markers to actual paragraph breaks
+        review_text = review_text.replace("[PARA]", "\n\n")
+
+        # clean hyphenation throughout
+        review_text           = _clean_text(review_text)
+        research_gaps_summary = _clean_text(research_gaps_summary)
+        future_directions     = _clean_text(future_directions)
+
+        # enforce minimum length — retry if too short
+        if len(review_text) < 800 and state["retry_count"] < 2:
+            logger.warning(
+                f"[LIT REVIEW] review too short ({len(review_text)} chars) — retrying"
+            )
+            return {
+                **state,
+                "error":       "review too short",
+                "retry_count": state["retry_count"] + 1,
+            }
+
+        logger.info(
+            f"[LIT REVIEW] generated {len(review_text)} chars "
+            f"quality={overall_quality}"
+        )
 
         return {
             **state,
@@ -203,7 +259,9 @@ Research Gaps:    {gaps_text}
         }
 
     except Exception as e:
-        logger.warning(f"[LIT REVIEW] generation failed attempt {state['retry_count']+1}: {e}")
+        logger.warning(
+            f"[LIT REVIEW] generation failed attempt {state['retry_count']+1}: {e}"
+        )
         return {
             **state,
             "error":       str(e),
@@ -251,7 +309,7 @@ class LiteratureReviewAgent:
         comparison: Dict[str, Any] = {},
     ) -> Dict[str, Any]:
         """
-        Generate literature review from all paper analyses.
+        Generate structured literature review from all paper analyses.
         Returns: {themes, review_text, research_gaps_summary,
                   future_directions, overall_quality}
         """

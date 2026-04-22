@@ -97,29 +97,38 @@ class ArxivService:
 
     async def search_by_entities(
         self,
-        models:   List[str] = [],
-        datasets: List[str] = [],
-        methods:  List[str] = [],
-        title:    str = "",
+        models:      List[str] = [],
+        datasets:    List[str] = [],
+        methods:     List[str] = [],
+        tasks:       List[str] = [],
+        title:       str = "",
         max_results: int = 5,
     ) -> List[Dict]:
-        """
-        Build optimized query from entities and search.
-        Combines title + top models + methods for best results.
-        """
+        _STOPWORDS = {
+            "the", "a", "an", "of", "for", "on", "in", "with",
+            "using", "based", "via", "and", "or", "to", "from",
+            "towards", "approach", "method", "model", "paper",
+            "research", "study", "analysis", "learning",
+        }
         parts = []
-        if title:
-            # use first 5 words of title
-            parts.extend(title.split()[:5])
-        if models:
-            parts.extend(models[:2])
-        if methods:
-            parts.extend(methods[:2])
+        for term in models[:2]:
+            parts.extend([w for w in term.split() if w.lower() not in _STOPWORDS][:2])
+        for term in datasets[:2]:
+            parts.extend([w for w in term.split() if w.lower() not in _STOPWORDS][:2])
+        for term in methods[:1]:
+            parts.extend([w for w in term.split() if w.lower() not in _STOPWORDS][:2])
+        for term in tasks[:1]:
+            parts.extend([w for w in term.split() if w.lower() not in _STOPWORDS][:1])
 
-        query = " ".join(parts).strip()
+        # fallback to title only if nothing else
+        if not parts and title:
+            parts = [w for w in title.split() if w.lower() not in _STOPWORDS and len(w) > 3][:3]
+
+        parts = list(dict.fromkeys(parts))  # deduplicate preserving order
+        query = " ".join(parts).strip()[:80]
+        
         if not query:
             return []
-
         return await self.search(query, max_results)
 
     async def fetch_paper_details(self, arxiv_id: str) -> Optional[Dict]:

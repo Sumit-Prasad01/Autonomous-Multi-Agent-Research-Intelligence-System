@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import time
 from contextlib import asynccontextmanager
-
+import asyncio
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,11 +25,9 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up …")
     await init_db()
     await get_redis()
-    # pre-warm embedding model in background thread so first upload is fast
-    import asyncio
+    # pre-warm embedding model
     from src.research_intelligence_system.rag.vector_store import _store
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, lambda: _store.embeddings)
+    asyncio.get_event_loop().run_in_executor(None, lambda: _store.embeddings)
     logger.info("Ready.")
     yield
     logger.info("Shutting down.")

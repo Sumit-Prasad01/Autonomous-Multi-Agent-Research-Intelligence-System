@@ -12,6 +12,8 @@ LLM_OPTIONS = [
     "llama-3.1-8b-instant",
     "llama-3.3-70b-versatile",
     "llama3-70b-8192",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b"
 ]
 
 # frontend/ui.py
@@ -35,7 +37,7 @@ MIN_CHUNK_CHARS = 50
 COLLECTION_NAME  = "research_papers"
 EMBED_BATCH_SIZE = 64
 VECTOR_DIM       = 384          # all-MiniLM-L6-v2 output dim
-HF_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+HF_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # or BAAI/bge-large-en-v1.5
 # HF_MODEL_NAME = "BAAI/bge-base-en-v1.5"
 # VECTOR_DIM    = 768
 
