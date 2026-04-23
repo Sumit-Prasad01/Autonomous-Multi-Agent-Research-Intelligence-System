@@ -208,6 +208,9 @@ class LiteratureReview(Base):
     future_directions    = Column(Text, default="")
     overall_quality      = Column(Float, default=0.0)
     created_at           = Column(DateTime(timezone=True), server_default=func.now())
+    cross_paper_gaps      = Column(JSON, default=list)
+    field_level_insight   = Column(Text,  default="")
+    cross_paper_novelty   = Column(Float, default=0.0)
 
     __table_args__ = (
         Index("ix_litreview_chat", "chat_id"),

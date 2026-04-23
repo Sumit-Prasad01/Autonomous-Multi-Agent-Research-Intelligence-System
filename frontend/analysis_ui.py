@@ -256,6 +256,25 @@ def render_analysis(analysis: Dict) -> None:
             chat_id=st.session_state.current_chat_id,
             papers=papers,
         )
+    # Cross-paper gaps (only shown for multi-paper chats)
+    cross = analysis.get("cross_paper_gaps", {})
+    if cross and cross.get("gaps"):
+        with st.expander("🔀 Cross-Paper Research Gaps"):
+            if cross.get("field_insight"):
+                st.markdown(
+                    f"<div style='...'>💡 {cross['field_insight']}</div>",
+                    unsafe_allow_html=True,
+                )
+            for i, gap in enumerate(cross["gaps"], 1):
+                st.markdown(
+                    f'<div class="gap-item">'
+                    f'<b>#{i} [{gap["novelty_score"]:.1f}/10]</b> {gap["gap"]}<br>'
+                    f'<small>📄 {gap.get("paper_1","")} × {gap.get("paper_2","")}</small><br>'
+                    f'<small>📎 {gap.get("supporting_evidence","")}</small><br>'
+                    f'<small>🧪 {gap.get("suggested_experiment","")}</small>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     # ── Cross-paper: Comparison ───────────────────────────────────────────────
     comp = analysis.get("comparison", {})

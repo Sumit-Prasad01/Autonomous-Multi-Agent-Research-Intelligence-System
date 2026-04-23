@@ -245,4 +245,9 @@ async def get_analysis(
             "future_directions":     lit_review.future_directions     if lit_review else "",
             "overall_quality":       lit_review.overall_quality       if lit_review else 0.0,
         } if lit_review else {},
+        "cross_paper_gaps": {
+            "gaps":          lit_review.cross_paper_gaps    if lit_review else [],
+            "field_insight": lit_review.field_level_insight if lit_review else "",
+            "novelty_score": lit_review.cross_paper_novelty if lit_review else 0.0,
+        } if lit_review else {},
     }

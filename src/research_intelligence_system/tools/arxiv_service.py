@@ -4,6 +4,7 @@ Used by comparison_agent (single paper mode) and orchestrator
 """
 from __future__ import annotations
 
+import re
 import asyncio
 import hashlib
 import time
@@ -122,11 +123,16 @@ class ArxivService:
 
         # fallback to title only if nothing else
         if not parts and title:
-            parts = [w for w in title.split() if w.lower() not in _STOPWORDS and len(w) > 3][:3]
+            clean_title = re.sub(r'^[a-f0-9]{32}_', '', title)  # strip MD5
+            clean_title = re.sub(r'\.pdf$', '', clean_title, flags=re.IGNORECASE)
+            clean_title = clean_title.replace('_', ' ').replace('-', ' ')
+            parts = [w for w in clean_title.split() 
+                    if w.lower() not in _STOPWORDS and len(w) > 3][:3]
 
         parts = list(dict.fromkeys(parts))  # deduplicate preserving order
         query = " ".join(parts).strip()[:80]
-        
+        query = re.sub(r'\b\w\b', '', query).strip()
+
         if not query:
             return []
         return await self.search(query, max_results)

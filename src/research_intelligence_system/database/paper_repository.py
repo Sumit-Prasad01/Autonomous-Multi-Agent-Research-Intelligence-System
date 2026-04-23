@@ -194,6 +194,9 @@ async def save_literature_review(
     research_gaps_summary: str,
     future_directions: str,
     overall_quality: float,
+    cross_paper_gaps: list = [],        
+    field_level_insight: str = "",      
+    cross_paper_novelty: float = 0.0,
 ) -> LiteratureReview:
     review = LiteratureReview(
         chat_id=uuid.UUID(chat_id),
@@ -203,6 +206,9 @@ async def save_literature_review(
         research_gaps_summary=research_gaps_summary,
         future_directions=future_directions,
         overall_quality=overall_quality,
+        cross_paper_gaps    = cross_paper_gaps,
+        field_level_insight = field_level_insight,
+        cross_paper_novelty = cross_paper_novelty,
     )
     db.add(review)
     await db.commit()

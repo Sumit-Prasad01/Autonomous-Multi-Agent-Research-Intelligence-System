@@ -11,7 +11,7 @@ from typing import Any, Dict, List, TypedDict
 
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
-
+from src.research_intelligence_system.core.groq_limiter import wait_for_groq
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -373,6 +373,9 @@ class GapDetectionAgent:
         Returns: {missing_edges, research_gaps, future_directions, novelty_score}
         """
         import asyncio
+
+        await wait_for_groq(self.llm_id, "gap_detection")
+
         loop = asyncio.get_running_loop()
 
         initial_state: GapState = {

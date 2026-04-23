@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
 
+from src.research_intelligence_system.core.groq_limiter import wait_for_groq
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -24,7 +25,8 @@ class ExtractionState(TypedDict):
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 def _get_llm(llm_id: str) -> ChatGroq:
-    return ChatGroq(model=llm_id, temperature=0)
+    _EXTRACTION_MODEL = "llama-3.1-8b-instant"
+    return ChatGroq(model=_EXTRACTION_MODEL, temperature=0)
 
 
 # ── Math / formula pre-filter ─────────────────────────────────────────────────
@@ -46,21 +48,54 @@ def _clean_section(text: str, max_chars: int) -> str:
 # ── Regex fallback ────────────────────────────────────────────────────────────
 def _regex_fallback(sections: Dict[str, str]) -> Dict[str, Any]:
     """
-    Last-resort extraction when LLM returns no JSON.
-    Pulls capitalized multi-word phrases near domain keywords.
+    Improved fallback — extracts common paper-specific patterns.
+    Handles: CamelCase names, hyphenated names, abbreviations.
     """
     full_text = " ".join(sections.values())
 
-    def _find_near(keyword: str) -> List[str]:
-        pattern = rf'{keyword}[s]?\s+(?:called\s+|named\s+|dubbed\s+)?([A-Z][A-Za-z0-9\-]+(?:\s+[A-Z][A-Za-z0-9\-]+){{0,2}})'
-        return list(set(re.findall(pattern, full_text)))[:5]
+    # Pattern 1: CamelCase names (TurboQuant, RabitQ, ViT-B)
+    camel_case = re.findall(
+        r'\b[A-Z][a-z]+(?:[A-Z][a-z]*)+\b|\b[A-Z]{2,}[a-z]+\b', 
+        full_text
+    )
+
+    # Pattern 2: Hyphenated technical names (ViT-B/32, Lloyd-Max, k-means)
+    hyphenated = re.findall(
+        r'\b[A-Z][a-zA-Z]*(?:-[A-Z0-9][a-zA-Z0-9]*)+\b',
+        full_text
+    )
+
+    # Pattern 3: Known dataset patterns (MNIST, ImageNet, SQuAD, GLUE)
+    datasets = re.findall(
+        r'\b(?:ImageNet|CIFAR|MNIST|SQuAD|GLUE|WMT|DBpedia|'
+        r'OpenImages|COCO|LibriSpeech|CommonCrawl|C4|WebText)\b',
+        full_text
+    )
+
+    # Pattern 4: Metric patterns (accuracy, F1, BLEU, Recall@K)
+    metrics = re.findall(
+        r'\b(?:accuracy|F1|BLEU|ROUGE|NDCG|MRR|Recall@\d+|'
+        r'precision|perplexity|MSE|RMSE|AUC|mAP)\b',
+        full_text, re.IGNORECASE
+    )
+
+    # Pattern 5: Near-keyword extraction for models
+    model_context = re.findall(
+        r'(?:propose|present|introduce|develop|our)\s+([A-Z][a-zA-Z0-9\-]+)',
+        full_text
+    )
+
+    # combine and deduplicate
+    all_models = list(dict.fromkeys(
+        camel_case[:8] + hyphenated[:5] + model_context[:3]
+    ))
 
     return {
-        "models":          _find_near("model") + _find_near("network") + _find_near("algorithm"),
-        "datasets":        _find_near("dataset") + _find_near("corpus") + _find_near("benchmark"),
-        "metrics":         _find_near("metric") + _find_near("score") + _find_near("accuracy"),
-        "methods":         _find_near("method") + _find_near("approach") + _find_near("technique"),
-        "tasks":           _find_near("task") + _find_near("problem"),
+        "models":          all_models[:10],
+        "datasets":        list(dict.fromkeys(datasets))[:8],
+        "metrics":         list(dict.fromkeys(metrics))[:8],
+        "methods":         list(dict.fromkeys(hyphenated[:3]))[:5],
+        "tasks":           [],
         "hyperparameters": {},
         "authors":         [],
         "year":            "",
@@ -74,14 +109,14 @@ This works for ANY scientific domain — not just ML/NLP.
 
 Return ONLY valid JSON with this exact structure:
 {{
-  "models": ["model, algorithm, or framework names used or proposed"],
+  "models": ["model, algorithm, or framework names"],
   "datasets": ["dataset, corpus, benchmark, or data source names"],
-  "metrics": ["evaluation metrics, measurements, or performance indicators"],
-  "methods": ["methods, techniques, algorithms, or analytical approaches"],
-  "tasks": ["research tasks, objectives, or problems addressed"],
-  "hyperparameters": {{"param_name": "value"}},
-  "authors": ["author names if explicitly mentioned"],
-  "year": "publication year if mentioned, else empty string"
+  "metrics": ["evaluation metrics or performance indicators"],
+  "methods": ["methods, techniques, or analytical approaches"],
+  "tasks": ["research tasks, objectives, or problems"],
+  "hyperparameters": {{}},
+  "authors": [],
+  "year": ""
 }}
 
 If no entities exist for a field, return an empty list [].
@@ -90,17 +125,13 @@ For finance: indices, instruments, models. For NLP: model architectures, corpora
 
 Paper sections:
 ABSTRACT: {abstract}
-
 INTRODUCTION: {introduction}
-
 METHODOLOGY: {methodology}
-
 RESULTS: {results}
-
 CONCLUSION: {conclusion}
 
-CRITICAL: Response must start with {{ and end with }}.
-No text before or after. No markdown. No explanation. Pure JSON only."""
+IMPORTANT: Return ONLY the JSON object above. Start with {{ and end with }}.
+No markdown, no explanation, no code blocks."""
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -128,7 +159,11 @@ def _extract_node(state: ExtractionState) -> ExtractionState:
         if not json_match:
             raise ValueError("No JSON found in response")
 
-        cleaned  = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', json_match.group())
+        cleaned = json_match.group()
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
+        # Fix single quotes → double quotes
+        cleaned = re.sub(r"(?<=[{,])\s*'([^']+)'\s*:", r' "\1":', cleaned)
+        cleaned = re.sub(r":\s*'([^']*)'", r': "\1"', cleaned)
         entities = json.loads(cleaned)
 
         count = sum(len(v) if isinstance(v, list) else 1 for v in entities.values())
@@ -232,6 +267,9 @@ class ExtractionAgent:
         Returns entities dict.
         """
         import asyncio
+
+        await wait_for_groq(self.llm_id, "extraction")
+
         loop = asyncio.get_running_loop()
 
         initial_state: ExtractionState = {

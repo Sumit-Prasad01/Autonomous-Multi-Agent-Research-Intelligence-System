@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 from typing import Any, Dict, List, TypedDict
 
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
+from src.research_intelligence_system.core.groq_limiter import wait_for_groq
 
 from src.research_intelligence_system.utils.logger import get_logger
 
@@ -30,7 +32,8 @@ class TripleState(TypedDict):
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 def _get_llm(llm_id: str) -> ChatGroq:
-    return ChatGroq(model=llm_id, temperature=0, max_tokens=2000)
+    _TRIPLE_MODEL = "llama-3.1-8b-instant"
+    return ChatGroq(model=_TRIPLE_MODEL, temperature=0, max_tokens=2000)
 
 
 # ── Text cleaning ─────────────────────────────────────────────────────────────
@@ -78,9 +81,8 @@ Relation types to use:
 - BASED_ON         : method based on architecture/theory
 - REPLACES         : method replaces older approach
 - OUTPERFORMS      : method outperforms another on benchmark
-- BOUNDED_BY       : method performance bounded by theoretical limit
+- BOUNDED_BY       : performance bounded by theoretical limit
 - EXTENDS          : method extends or generalizes another
-- VALIDATED_ON     : theoretical result validated on dataset
 
 Known entities from this paper:
 Models/Algorithms: {models}
@@ -102,7 +104,11 @@ Return ONLY this format:
 
 Rules:
 - Use EXACT entity names from known entities list when possible
-- If specific name unclear use descriptive name like "proposed method" or "baseline model"
+- If known entities list is empty, extract entity names DIRECTLY from paper text
+- NEVER use generic names like "proposed method", "existing methods", "baseline model"
+- Always use the actual name from the paper (e.g. TurboQuant, RabitQ, ViT-B/32, BERT)
+- For quantization papers: look for TurboQuant, RabitQ, PQ, VQ, Lloyd-Max
+- For vision papers: look for ViT-B/32, ResNet, CLIP variants by exact name
 - Skip any triple where subject or object is a math formula, symbol, or number
 - confidence: 0.7-1.0 based on how explicitly stated in paper
 - Extract 10-40 triples maximum
@@ -148,11 +154,11 @@ def _extract_triples_node(state: TripleState) -> TripleState:
         logger.info(f"[TRIPLES DEBUG] raw={raw[:300]}")
 
         # find JSON array — handle cases where LLM adds text before/after
-        json_match = re.search(r'\[.*\]', raw, re.DOTALL)
-        if not json_match:
+        start = raw.find('[')
+        end   = raw.rfind(']')
+        if start == -1 or end == -1 or end <= start:
             raise ValueError("No JSON array found in response")
-
-        cleaned = json_match.group()
+        cleaned = raw[start:end+1]
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
         triples = json.loads(cleaned)
         logger.info(f"[TRIPLES] extracted {len(triples)} triples")
@@ -280,12 +286,14 @@ class TripleExtractor:
         Returns list of {subject, relation, object, confidence} dicts.
         Filters out math formulas and invalid triples automatically.
         """
-        import asyncio
+
+        await wait_for_groq(self.llm_id, "triples")  # ← separate line, before state
+
         loop = asyncio.get_running_loop()
 
         initial_state: TripleState = {
             "paper_id":    paper_id,
-            "llm_id":      self.llm_id,
+            "llm_id":      self.llm_id,  # ← unchanged
             "sections":    sections,
             "entities":    entities,
             "triples":     [],

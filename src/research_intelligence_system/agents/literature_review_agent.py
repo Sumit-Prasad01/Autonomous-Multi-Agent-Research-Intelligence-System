@@ -10,7 +10,7 @@ from typing import Any, Dict, List, TypedDict
 
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
-
+from src.research_intelligence_system.core.groq_limiter import wait_for_groq
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -314,6 +314,9 @@ class LiteratureReviewAgent:
                   future_directions, overall_quality}
         """
         import asyncio
+
+        await wait_for_groq(self.llm_id, "lit_review_generate")
+
         loop = asyncio.get_running_loop()
 
         initial_state: LitReviewState = {

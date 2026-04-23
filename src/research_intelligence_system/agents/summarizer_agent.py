@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
-
+from src.research_intelligence_system.core.groq_limiter import wait_for_groq
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -248,6 +248,8 @@ class SummarizerAgent:
           comprehensive:     single detailed summary
           overall:           alias for comprehensive (backward compat)
         """
+        await wait_for_groq(self.llm_id, "summarization")
+
         loop = asyncio.get_running_loop()
 
         initial_state: SummaryState = {
