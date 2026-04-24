@@ -25,27 +25,27 @@ logger = get_logger(__name__)
 
 # ── Per-model token budgets (conservative — 80% of actual limit) ──────────────
 _MODEL_TPM: Dict[str, int] = {
-    "llama-3.1-8b-instant":           4800,
-    "llama-3.3-70b-versatile":        4800,
-    "llama3-70b-8192":                4800,
-    "openai/gpt-oss-120b":            4800,
-    "openai/gpt-oss-20b":             4800,
-    "meta-llama/llama-4-scout-17b-16e-instruct": 4800,
+    "llama-3.1-8b-instant":           5500,
+    "llama-3.3-70b-versatile":        5500,
+    "llama3-70b-8192":                5500,
+    "openai/gpt-oss-120b":            5500,
+    "openai/gpt-oss-20b":            55000,
+    "meta-llama/llama-4-scout-17b-16e-instruct": 5500,
 }
-_DEFAULT_TPM = 4800
+_DEFAULT_TPM = 5500
 
 # ── Estimated tokens per stage (input + output) ───────────────────────────────
 STAGE_TOKENS: Dict[str, int] = {
-    "extraction":          2000,
-    "summarization":       1500,
-    "critic":              2000,
-    "critic_refine":       1500,
-    "triples":             2500,
-    "gap_detection":       2500,
-    "comparison":          2000,
-    "lit_review_themes":   1000,
-    "lit_review_generate": 2500,
-    "qa":                  1500,
+    "extraction":          1200,
+    "summarization":       800,
+    "critic":              1000,
+    "critic_refine":       800,
+    "triples":             1200,
+    "gap_detection":       1500,
+    "comparison":          1200,
+    "lit_review_themes":   600,
+    "lit_review_generate": 1500,
+    "qa":                  800,
 }
 
 

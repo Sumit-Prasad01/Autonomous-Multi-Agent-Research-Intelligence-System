@@ -109,61 +109,48 @@ Return only JSON, no explanation."""
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
-    """Fetch related papers from arXiv + Tavily (single paper mode only)."""
     if not state["use_web"]:
         return state
 
     logger.info("[COMPARISON] fetching web papers for single-paper comparison")
-
     analyses = state["paper_analyses"]
     if not analyses:
         return {**state, "error": "no paper analyses found"}
 
     paper    = analyses[0]
     entities = paper.entities or {}
-    methods = list(dict.fromkeys(entities.get("methods", [])[:3]))
-    models  = list(dict.fromkeys(entities.get("models",  [])[:2]))
-
-    # clean title — strip hash prefix from filename
-    title = _clean_title(paper.filename or "")
-
-    # build search query — use clean title + top models + methods
-    query_parts = []
-    if title and title != "Uploaded Paper":
-        query_parts.extend(title.split()[:5])   # first 5 words of title
-    query_parts.extend(models[:2])
-    query_parts.extend(methods[:2])
-    query = " ".join(query_parts).strip()[:150]
-
-    logger.info(f"[COMPARISON] arXiv query: {query!r}")
+    title    = _clean_title(paper.filename or "")
 
     web_papers = []
 
-    # arXiv search
+    # ── arXiv via search_by_entities (consistent query building) ──────────
     try:
-        import arxiv
-        search = arxiv.Search(
-            query      = query,
-            max_results= 5,
-            sort_by    = arxiv.SortCriterion.Relevance,
+        import asyncio
+        from src.research_intelligence_system.tools.arxiv_service import ArxivService
+
+        loop = asyncio.new_event_loop()
+        arxiv_papers = loop.run_until_complete(
+            ArxivService().search_by_entities(
+                models   = entities.get("models",   []),
+                datasets = entities.get("datasets", []),
+                methods  = entities.get("methods",  []),
+                tasks    = entities.get("tasks",    []),
+                title    = title,
+                max_results = 5,
+            )
         )
-        for r in search.results():
-            web_papers.append({
-                "title":    r.title,
-                "abstract": r.summary[:500],
-                "authors":  [a.name for a in r.authors[:3]],
-                "year":     r.published.year if r.published else "",
-                "arxiv_id": r.entry_id,
-                "source":   "arxiv",
-            })
-        logger.info(f"[COMPARISON] arXiv: {len(web_papers)} papers")
+        loop.close()
+        web_papers.extend(arxiv_papers)
+        logger.info(f"[COMPARISON] arXiv: {len(arxiv_papers)} papers")
     except Exception as e:
         logger.warning(f"[COMPARISON] arXiv failed: {e}")
 
-    # Tavily — use clean title, not hash
+    # ── Tavily web search ──────────────────────────────────────────────────
     try:
         from src.research_intelligence_system.tools.web_search import sync_web_search
-        tavily_query = f"research papers similar to {title} {' '.join(models[:2])}"
+        # use clean title + top 2 models only
+        models_str   = " ".join(entities.get("models", [])[:2])
+        tavily_query = f"research papers similar to {title} {models_str}".strip()
         web_text     = sync_web_search(tavily_query)
         if web_text:
             web_papers.append({
@@ -171,6 +158,7 @@ def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
                 "abstract": web_text[:800],
                 "source":   "tavily",
             })
+        logger.info(f"[WEB SEARCH] query={tavily_query!r:.60}")
     except Exception as e:
         logger.warning(f"[COMPARISON] Tavily failed: {e}")
 

@@ -33,30 +33,38 @@ def _get_cached(key: str) -> Optional[List]:
 
 
 def _search_arxiv(query: str, max_results: int = 5) -> List[Dict]:
-    """Sync arXiv search — runs in threadpool."""
+    """Sync arXiv search with controlled retry."""
+    import arxiv
+    import time
+
+    clean_query = re.sub(r'[/\\%]', ' ', query)  # remove URL-unsafe chars
+    clean_query = re.sub(r'\s{2,}', ' ', clean_query).strip()[:100]
+
     try:
-        import arxiv
-
-        search = arxiv.Search(
-            query      = query[:100],
-            max_results= max_results,
-            sort_by    = arxiv.SortCriterion.Relevance,
+        client = arxiv.Client(
+            page_size     = max_results,
+            delay_seconds = 4,    # controlled delay
+            num_retries   = 2,    # fewer retries
         )
-
+        search = arxiv.Search(
+            query       = clean_query,
+            max_results = max_results,
+            sort_by     = arxiv.SortCriterion.Relevance,
+        )
         papers = []
-        for r in search.results():
+        for r in client.results(search):
             papers.append({
-                "title":       r.title,
-                "abstract":    r.summary[:600],
-                "authors":     [a.name for a in r.authors[:4]],
-                "year":        r.published.year if r.published else "",
-                "arxiv_id":    r.entry_id.split("/")[-1],
-                "url":         r.entry_id,
-                "categories":  r.categories[:3],
-                "source":      "arxiv",
+                "title":      r.title,
+                "abstract":   r.summary[:600],
+                "authors":    [a.name for a in r.authors[:4]],
+                "year":       r.published.year if r.published else "",
+                "arxiv_id":   r.entry_id.split("/")[-1],
+                "url":        r.entry_id,
+                "categories": r.categories[:3],
+                "source":     "arxiv",
             })
 
-        logger.info(f"[ARXIV] query={query!r:.50} → {len(papers)} papers")
+        logger.info(f"[ARXIV] query='{clean_query[:50]}' → {len(papers)} papers")
         return papers
 
     except Exception as e:
@@ -110,6 +118,9 @@ class ArxivService:
             "using", "based", "via", "and", "or", "to", "from",
             "towards", "approach", "method", "model", "paper",
             "research", "study", "analysis", "learning",
+            "arxiv", "ieee", "acm", "neurips", "icml", "iclr",
+            "transactions", "proceedings", "conference", "journal",
+            "retrieval", "augmented", "generation", 
         }
         parts = []
         for term in models[:2]:

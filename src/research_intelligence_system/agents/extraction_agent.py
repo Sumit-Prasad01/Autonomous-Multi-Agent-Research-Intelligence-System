@@ -25,8 +25,7 @@ class ExtractionState(TypedDict):
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 def _get_llm(llm_id: str) -> ChatGroq:
-    _EXTRACTION_MODEL = "llama-3.1-8b-instant"
-    return ChatGroq(model=_EXTRACTION_MODEL, temperature=0)
+    return ChatGroq(model=llm_id, temperature=0)
 
 
 # ── Math / formula pre-filter ─────────────────────────────────────────────────
@@ -103,7 +102,9 @@ def _regex_fallback(sections: Dict[str, str]) -> Dict[str, Any]:
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
-_EXTRACTION_PROMPT = """You are a scientific paper entity extractor.
+_EXTRACTION_PROMPT = """
+RESPOND WITH JSON ONLY. NO PREAMBLE. NO EXPLANATION. NO MARKDOWN.
+You are a scientific paper entity extractor.
 Extract ALL named entities from the paper sections below.
 This works for ANY scientific domain — not just ML/NLP.
 
@@ -154,6 +155,10 @@ def _extract_node(state: ExtractionState) -> ExtractionState:
         llm      = _get_llm(state["llm_id"])
         response = llm.invoke(prompt)
         raw      = response.content.strip()
+
+        raw = re.sub(r'```(?:json)?\s*', '', raw)
+        raw = re.sub(r'```\s*$', '', raw)
+        raw = raw.strip()
 
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
