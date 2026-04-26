@@ -52,59 +52,140 @@ def _clean_title(filename: str) -> str:
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
-_WEB_COMPARISON_PROMPT = """You are a research paper comparison expert.
-Compare the uploaded paper against related papers found on the web.
+_WEB_COMPARISON_PROMPT = """[SYSTEM] You are a scientific literature analyst. \
+Your task is to compare an uploaded research paper against related papers retrieved from the web. \
+You produce structured JSON only. Every claim in your output must be traceable to the provided text.
 
-Uploaded Paper:
-Title:    {title}
-Summary:  {summary}
-Models:   {models}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+UPLOADED PAPER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Title   : {title}
+Summary : {summary}
+Models  : {models}
 Datasets: {datasets}
-Metrics:  {metrics}
-Methods:  {methods}
+Metrics : {metrics}
+Methods : {methods}
 
-Related Papers Found Online:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RELATED PAPERS (retrieved from arXiv / web)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {web_papers}
 
-Return ONLY valid JSON:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ANALYSIS INSTRUCTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# In _WEB_COMPARISON_PROMPT, inside the comparison_table instruction block, add:
+
+PHANTOM ROW RULE: 
+  • Every row must correspond to a named research paper.
+    Do not create rows for datasets, benchmarks, or metric values that are
+    not themselves paper titles. If the uploaded paper reports a result
+    (e.g. "85.43% Top-1 on ImageNet"), that value belongs in the uploaded
+    paper's row — not in a separate row named after the dataset.
+comparison_table:
+  • One row per paper (uploaded paper first, then related papers).
+  • Model: use the primary model/algorithm name. Use "N/A" if not stated.
+  • Dataset: use the primary evaluation dataset. Use "N/A" if not stated.
+  • Key Metric: use the metric name that best characterises the paper's main result.
+  • Score: copy the EXACT value from the source text. Use "N/A" if not explicitly stated — do NOT invent or estimate.
+  • Year: use publication year. Use "N/A" if unknown.
+  • PHANTOM ROW RULE: every row must correspond to a named research paper.
+    Do not create rows for datasets, benchmarks, or metric values that are
+    not themselves paper titles. Results from the uploaded paper belong in
+    the uploaded paper's row only — never in a separate row.
+  • HALLUCINATION RULE: every cell value must appear verbatim in the provided text above.
+    If you cannot find it, write "N/A".
+
+ranking:
+  • Order papers from strongest to weakest contribution.
+  • If the primary metric is the same across papers, rank by that metric score descending.
+  • If metrics differ, rank by recency (newest first).
+  • If only one paper has a score, it ranks first; others follow by year.
+  • State your ranking criterion in a brief prefix, e.g. "Ranked by Top-1 Accuracy on ImageNet:"
+
+evolution_trends:
+  • 2–3 sentences. Describe how the methods or results in these papers represent a progression
+    or shift in the research area. Ground claims in the paper titles/abstracts provided.
+
+positioning:
+  • 2–3 sentences. Explain where the uploaded paper sits relative to the retrieved work:
+    ahead, behind, orthogonal, or complementary. Be specific about WHY.
+
+web_papers_used:
+  • List only papers that contributed at least one cell value in the comparison_table.
+  • Format: {{"title": "paper title", "url": "url or arxiv_id if available"}}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT — JSON ONLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {{
   "comparison_table": {{
     "headers": ["Paper", "Model", "Dataset", "Key Metric", "Score", "Year"],
     "rows": [
-      ["Uploaded Paper", "model_name", "dataset_name", "metric_name", "score", "year"],
-      ["Related Paper 1", "...", "...", "...", "...", "..."]
+      ["{title}", "model_name", "dataset_name", "metric_name", "score_or_N/A", "year_or_N/A"],
+      ["Related Paper Title", "...", "...", "...", "...", "..."]
     ]
   }},
-  "ranking": ["Paper names ranked best to worst by performance"],
-  "evolution_trends": "How this research area has evolved over time",
-  "positioning": "Where the uploaded paper sits in the research landscape",
-  "web_papers_used": ["list of paper titles used in comparison"]
-}}
+  "ranking": "Ranked by <criterion>: 1. Paper A, 2. Paper B, ...",
+  "evolution_trends": "2-3 sentence trend analysis grounded in the provided abstracts.",
+  "positioning": "2-3 sentence positioning of the uploaded paper relative to retrieved work.",
+  "web_papers_used": [
+    {{"title": "paper title", "url": "url or N/A"}}
+  ]
+}}"""
 
-Return only JSON, no explanation."""
 
+_DIRECT_COMPARISON_PROMPT = """[SYSTEM] You are a scientific literature analyst. \
+Your task is to compare {n} uploaded research papers directly against each other. \
+You produce structured JSON only. Every claim must be traceable to the provided paper summaries below.
 
-_DIRECT_COMPARISON_PROMPT = """You are a research paper comparison expert.
-Compare these {n} papers against each other.
-
-Papers:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PAPERS TO COMPARE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {papers}
 
-Return ONLY valid JSON:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ANALYSIS INSTRUCTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+comparison_table:
+  • One row per paper, in the order provided above.
+  • Model: primary model or algorithm name. "N/A" if absent.
+  • Dataset: primary evaluation dataset. "N/A" if absent.
+  • Key Metric: the metric that best characterises each paper's main claim.
+    If papers use different metrics, choose the most comparable one; note discrepancy in positioning.
+  • Score: EXACT value from the provided summary text. "N/A" if not explicitly stated. Do NOT estimate.
+  • Key Innovation: one clause naming what is technically new (e.g. "dynamic sparse attention",
+    "graph-based gap detection", "cross-encoder reranking"). Not the topic — the mechanism.
+  • HALLUCINATION RULE: if a value is not in the provided text, write "N/A".
+
+ranking:
+  • If all papers share the same primary metric → rank by that score descending.
+  • If metrics differ → rank by recency (newest first), note "metrics incomparable".
+  • Format: "Ranked by <criterion>: 1. <Paper Title>, 2. <Paper Title>, ..."
+
+evolution_trends:
+  • 2–3 sentences. Identify the methodological direction these papers collectively represent.
+    Is the field moving toward efficiency? Scale? Interpretability? Ground this in the summaries.
+
+positioning:
+  • 2–3 sentences. Identify which paper makes the most novel or impactful contribution and explain
+    the specific technical reason. If papers are in different sub-areas, say so explicitly.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT — JSON ONLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {{
   "comparison_table": {{
-    "headers": ["Paper", "Model", "Dataset", "Key Metric", "Score", "Approach"],
+    "headers": ["Paper", "Model", "Dataset", "Key Metric", "Score", "Key Innovation"],
     "rows": [
-      ["Paper 1 title", "model", "dataset", "metric", "score", "approach"],
-      ["Paper 2 title", "...", "...", "...", "...", "..."]
+      ["Paper 1 Title", "model", "dataset", "metric", "score_or_N/A", "one-clause innovation"],
+      ["Paper 2 Title", "...", "...", "...", "...", "..."]
     ]
   }},
-  "ranking": ["Paper titles ranked best to worst"],
-  "evolution_trends": "How approaches evolved across these papers",
-  "positioning": "Which paper makes the most significant contribution and why"
-}}
-
-Return only JSON, no explanation."""
+  "ranking": "Ranked by <criterion>: 1. Paper Title, 2. Paper Title, ...",
+  "evolution_trends": "2-3 sentence methodological trend analysis.",
+  "positioning": "2-3 sentence assessment of the most significant contribution and why."
+}}"""
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────

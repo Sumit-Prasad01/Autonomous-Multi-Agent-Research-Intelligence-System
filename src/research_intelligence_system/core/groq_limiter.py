@@ -1,15 +1,24 @@
 """
 groq_limiter.py — Centralized Groq API rate limit manager
-Tracks token usage and enforces per-minute budget across all agents.
-Prevents TPM exhaustion by spacing calls based on actual token consumption.
 
-Groq free tier limits:
-  llama-3.1-8b-instant:      6,000 TPM
-  llama-3.3-70b-versatile:   6,000 TPM
-  openai/gpt-oss-120b:       6,000 TPM (estimated)
+── WHY notify_complete() EXISTS ─────────────────────────────────────────────
+The inter-stage gap must be measured from when the LAST LLM CALL COMPLETED,
+not from when we started waiting. Without this, the sequence is:
 
-Dev tier limits (if upgraded):
-  All models:                ~30,000 TPM
+  T=0:   orchestrator calls wait_for_groq("comparison") → _last_call = T=0
+  T=0-5: comparison LLM runs (inside executor, takes 5s)
+  T=5:   executor returns
+  T=5.03: lit_review _sync_wait fires → gap_wait = 2.5 - (5.03 - 0) = 0 → NO SLEEP → 429
+
+With notify_complete() called at T=5:
+  T=5:   executor returns → orchestrator calls notify_complete() → _last_call = T=5
+  T=5.03: lit_review _sync_wait fires → gap_wait = 2.5 - (5.03 - 5) = 2.47s → SLEEP ✅
+
+Call pattern:
+  await wait_for_groq(model, stage)          # before dispatch
+  result = await loop.run_in_executor(...)   # agent runs LLM inside
+  notify_groq_complete()                     # after executor returns ← required
+─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
@@ -23,111 +32,90 @@ from src.research_intelligence_system.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# ── Per-model token budgets (conservative — 80% of actual limit) ──────────────
+# ── Per-model TPM budgets (85% of free-tier limit) ────────────────────────────
 _MODEL_TPM: Dict[str, int] = {
-    "llama-3.1-8b-instant":           5500,
-    "llama-3.3-70b-versatile":        5500,
-    "llama3-70b-8192":                5500,
-    "openai/gpt-oss-120b":            5500,
-    "openai/gpt-oss-20b":            55000,
-    "meta-llama/llama-4-scout-17b-16e-instruct": 5500,
+    "llama-3.1-8b-instant":                         5100,
+    "llama-3.3-70b-versatile":                      5100,
+    "llama3-70b-8192":                              5100,
+    "openai/gpt-oss-120b":                          5100,
+    "meta-llama/llama-4-scout-17b-16e-instruct":    5100,
 }
-_DEFAULT_TPM = 5500
+_DEFAULT_TPM = 5100
 
-# ── Estimated tokens per stage (input + output) ───────────────────────────────
+# ── Token estimates per stage ─────────────────────────────────────────────────
 STAGE_TOKENS: Dict[str, int] = {
     "extraction":          1200,
-    "summarization":       800,
-    "critic":              1000,
-    "critic_refine":       800,
-    "triples":             1200,
-    "gap_detection":       1500,
-    "comparison":          1200,
-    "lit_review_themes":   600,
-    "lit_review_generate": 1500,
-    "qa":                  800,
+    "summarization":        900,
+    "critic":              1100,
+    "critic_refine":        900,
+    "triples":             2500,
+    "gap_detection":       1900,
+    "comparison":          1500,
+    "lit_review_themes":    800,
+    "lit_review_generate": 2000,
+    "qa":                  1000,
 }
+
+# ── Minimum gap between consecutive LLM call COMPLETIONS (not starts) ─────────
+_MIN_INTER_STAGE_GAP: float = 2.5
 
 
 class GroqRateLimiter:
-    """
-    Token bucket rate limiter for Groq API.
-    Tracks rolling 60-second token window per model.
-    Thread-safe — shared across all agents.
-    """
 
-    def __init__(self):
-        self._lock         = threading.Lock()
-        self._usage:  Dict[str, list] = {}  # model → [(timestamp, tokens), ...]
-        self._window  = 60.0  # seconds
+    def __init__(self) -> None:
+        self._lock       = threading.Lock()
+        self._usage:     Dict[str, list] = {}
+        self._window     = 60.0
+        self._last_call: float = 0.0   # set AFTER each LLM call completes
 
     def _clean_window(self, model: str) -> None:
-        """Remove usage entries older than the rolling window."""
-        now     = time.monotonic()
-        cutoff  = now - self._window
-        entries = self._usage.get(model, [])
-        self._usage[model] = [(t, tok) for t, tok in entries if t > cutoff]
+        cutoff = time.monotonic() - self._window
+        self._usage[model] = [
+            (t, tok) for t, tok in self._usage.get(model, []) if t > cutoff
+        ]
 
     def _used_tokens(self, model: str) -> int:
-        """Tokens used in current window."""
         self._clean_window(model)
         return sum(tok for _, tok in self._usage.get(model, []))
 
     def _budget(self, model: str) -> int:
         return _MODEL_TPM.get(model, _DEFAULT_TPM)
 
-    def record(self, model: str, tokens: int) -> None:
-        """Record actual token usage after a Groq call."""
+    def reserve(self, model: str, tokens: int) -> None:
+        """Reserve tokens before an LLM call."""
         with self._lock:
-            self._usage.setdefault(model, []).append(
-                (time.monotonic(), tokens)
-            )
+            entries = self._usage.setdefault(model, [])
+            entries.append((time.monotonic(), tokens))
+            entries.sort(key=lambda x: x[0])
+
+    def notify_complete(self) -> None:
+        """Update _last_call to NOW. Call immediately after llm.invoke() returns."""
+        with self._lock:
+            self._last_call = time.monotonic()
 
     def wait_needed(self, model: str, estimated_tokens: int) -> float:
-        """
-        Calculate how many seconds to wait before making a call.
-        Returns 0.0 if budget allows immediate call.
-        """
         with self._lock:
-            used     = self._used_tokens(model)
-            budget   = self._budget(model)
-            combined = used + estimated_tokens
+            now    = time.monotonic()
+            used   = self._used_tokens(model)
+            budget = self._budget(model)
 
-            if combined <= budget:
-                return 0.0
+            token_wait = 0.0
+            if used + estimated_tokens > budget:
+                entries = self._usage.get(model, [])
+                if entries:
+                    token_wait = max(0.0, self._window - (now - entries[0][0]) + 1.0)
 
-            # find oldest entry to determine when window frees up
-            entries = self._usage.get(model, [])
-            if not entries:
-                return 0.0
+            gap_wait = max(0.0, _MIN_INTER_STAGE_GAP - (now - self._last_call))
+            return max(token_wait, gap_wait)
 
-            oldest_ts = entries[0][0]
-            now       = time.monotonic()
-            wait      = max(0.0, self._window - (now - oldest_ts) + 1.0)
-            return wait
-
-    async def wait_for_budget(
-        self,
-        model:            str,
-        stage:            str,
-        estimated_tokens: Optional[int] = None,
-    ) -> None:
-        """
-        Async wait until token budget allows this call.
-        Call this BEFORE every Groq API call.
-        """
+    async def wait_for_budget(self, model: str, stage: str,
+                               estimated_tokens: Optional[int] = None) -> None:
         tokens = estimated_tokens or STAGE_TOKENS.get(stage, 2000)
         wait   = self.wait_needed(model, tokens)
-
         if wait > 0:
-            logger.info(
-                f"[GROQ LIMITER] stage={stage} model={model} "
-                f"waiting {wait:.1f}s for token budget"
-            )
+            logger.info(f"[GROQ LIMITER] stage={stage} waiting {wait:.1f}s")
             await asyncio.sleep(wait)
-
-        # optimistically record — will be corrected by actual usage
-        self.record(model, tokens)
+        self.reserve(model, tokens)
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────
@@ -138,13 +126,31 @@ def get_limiter() -> GroqRateLimiter:
     return _limiter
 
 
-async def wait_for_groq(model: str, stage: str) -> None:
-    """
-    Convenience function — call before every Groq API invocation.
+# ── Public API ────────────────────────────────────────────────────────────────
 
-    Usage:
-        from src.research_intelligence_system.utils.groq_limiter import wait_for_groq
-        await wait_for_groq(state["llm_id"], "triples")
-        response = llm.invoke(prompt)
-    """
+async def wait_for_groq(model: str, stage: str) -> None:
+    """Call BEFORE dispatching to executor. Pair with notify_groq_complete() after."""
     await _limiter.wait_for_budget(model, stage)
+
+
+def notify_groq_complete() -> None:
+    """
+    Call AFTER run_in_executor (or llm.invoke) returns.
+    This is what makes gap enforcement work correctly.
+
+    Without this, _last_call is set at the START of the wait (before the LLM runs),
+    so by the time the next stage fires, the gap appears to have already elapsed.
+    """
+    _limiter.notify_complete()
+
+
+def sync_wait_for_groq(model: str, stage: str) -> None:
+    """
+    For use inside LangGraph nodes (sync executor threads).
+    Call BEFORE llm.invoke(). Pair with notify_groq_complete() after.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(wait_for_groq(model, stage))
+    finally:
+        loop.close()

@@ -78,6 +78,23 @@ def _render_knowledge_graph(chat_id: str, papers: List[Dict]) -> None:
         st.error(f"Graph render error: {e}")
 
 
+def _normalize_ranking(ranking) -> str:
+    """
+    Normalize the ranking field to a plain string regardless of whether
+    the backend returned a str (new prompt format) or a list (legacy format).
+
+    New format:  "Ranked by Top-1 (%): 1. Paper A, 2. Paper B, ..."
+    Legacy format: ["Paper A", "Paper B", ...]
+    """
+    if isinstance(ranking, list):
+        return ", ".join(
+            f"{i+1}. {r}" for i, r in enumerate(ranking) if str(r).strip()
+        )
+    if isinstance(ranking, str):
+        return ranking.strip()
+    return ""
+
+
 def render_analysis(analysis: Dict) -> None:
     papers = analysis.get("papers", [])
     if not papers:
@@ -256,6 +273,7 @@ def render_analysis(analysis: Dict) -> None:
             chat_id=st.session_state.current_chat_id,
             papers=papers,
         )
+
     # Cross-paper gaps (only shown for multi-paper chats)
     cross = analysis.get("cross_paper_gaps", {})
     if cross and cross.get("gaps"):
@@ -296,19 +314,29 @@ def render_analysis(analysis: Dict) -> None:
                     f"{comp['evolution_trends']}</div>",
                     unsafe_allow_html=True,
                 )
+
+            # ── Comparison table ──────────────────────────────────────────────
             table = comp.get("comparison_table", {})
             if table and table.get("headers") and table.get("rows"):
                 import pandas as pd
                 df = pd.DataFrame(table["rows"], columns=table["headers"])
-                st.dataframe(df, use_container_width=True)
-            if comp.get("ranking"):
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,            # ← Bug 2 fix: remove row index column
+                )
+
+            ranking_str = _normalize_ranking(comp.get("ranking", ""))
+            if ranking_str:
                 st.markdown(
-                    "<div style='margin-top:12px;font-size:0.85rem'>"
-                    + " <span style='color:#55556a;margin:0 6px'>›</span> ".join(
-                        f"<span style='color:#a5b4fc;font-weight:600'>{r}</span>"
-                        for r in comp["ranking"]
-                    )
-                    + "</div>",
+                    f"<div style='margin-top:12px;padding:10px 14px;"
+                    f"background:rgba(99,102,241,0.04);border-radius:8px;"
+                    f"font-size:0.85rem;color:#d0d0e8'>"
+                    f"<span style='font-size:0.7rem;color:#55556a;"
+                    f"text-transform:uppercase;letter-spacing:0.08em;"
+                    f"display:block;margin-bottom:6px'>Ranking</span>"
+                    f"{ranking_str}"
+                    f"</div>",
                     unsafe_allow_html=True,
                 )
 

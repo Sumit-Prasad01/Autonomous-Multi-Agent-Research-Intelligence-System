@@ -16,7 +16,7 @@ from src.research_intelligence_system.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _POOL      = ThreadPoolExecutor(max_workers=2, thread_name_prefix="arxiv")
-_CACHE_TTL = 3600   # 1 hour — arXiv results don't change often
+_CACHE_TTL = 3600   # 1 hour
 _cache: Dict[str, Tuple[List, float]] = {}
 
 
@@ -33,24 +33,24 @@ def _get_cached(key: str) -> Optional[List]:
 
 
 def _search_arxiv(query: str, max_results: int = 5) -> List[Dict]:
-    """Sync arXiv search with controlled retry."""
+    """Sync arXiv search — 25s timeout enforced by caller, 1 retry max."""
     import arxiv
-    import time
 
-    clean_query = re.sub(r'[/\\%]', ' ', query)  # remove URL-unsafe chars
-    clean_query = re.sub(r'\s{2,}', ' ', clean_query).strip()[:100]
+    clean_query = re.sub(r'[/\\%]', ' ', query)
+    clean_query = re.sub(r'\s{2,}', ' ', clean_query).strip()[:80]
 
     try:
         client = arxiv.Client(
             page_size     = max_results,
-            delay_seconds = 4,    # controlled delay
-            num_retries   = 2,    # fewer retries
+            delay_seconds = 3,
+            num_retries   = 1,
         )
         search = arxiv.Search(
             query       = clean_query,
             max_results = max_results,
             sort_by     = arxiv.SortCriterion.Relevance,
         )
+
         papers = []
         for r in client.results(search):
             papers.append({
@@ -64,12 +64,75 @@ def _search_arxiv(query: str, max_results: int = 5) -> List[Dict]:
                 "source":     "arxiv",
             })
 
-        logger.info(f"[ARXIV] query='{clean_query[:50]}' → {len(papers)} papers")
+        logger.info(f"[ARXIV] query='{clean_query[:60]}' → {len(papers)} papers")
         return papers
 
     except Exception as e:
         logger.warning(f"[ARXIV] search failed: {e}")
         return []
+
+
+# ── Stopwords for query building ──────────────────────────────────────────────
+# Covers: generic English, venue names, dataset boilerplate, structural
+# compound-word fragments (layer, head) that are meaningless alone.
+_STOPWORDS = {
+    # generic English
+    "the", "a", "an", "of", "for", "on", "in", "with", "using", "based",
+    "via", "and", "or", "to", "from", "towards", "its", "their", "our",
+    # meta words
+    "approach", "method", "model", "paper", "research", "study",
+    "analysis", "learning", "system", "framework",
+    # venue names
+    "arxiv", "ieee", "acm", "neurips", "icml", "iclr", "emnlp", "acl",
+    "naacl", "cvpr", "iccv", "eccv", "aaai", "ijcai",
+    "transactions", "proceedings", "conference", "journal", "workshop",
+    # dataset boilerplate
+    "retrieval", "augmented", "generation",
+    "wall", "street", "wsj", "penn", "treebank", "portion",
+    "corpus", "dataset", "benchmark", "split", "subset",
+    # generic structural fragments from hyphenated compound names
+    # e.g. "4-layer" → ["4","layer"] — "layer" alone is noise
+    "layer", "layers", "head", "heads", "scale", "scaled",
+    "large", "small", "tiny", "base", "deep", "pre", "fine",
+    "step", "block", "blocks", "unit", "units",
+}
+
+
+def _extract_best_token(term: str) -> str:
+    """
+    Extract the single highest-quality search token from an entity term.
+
+    Strategy:
+    1. Strip parenthetical abbreviations: "Wall Street Journal (WSJ)" → "Wall Street Journal"
+    2. Split on BOTH whitespace AND hyphens — fixes "4-layer" → ["4","layer"]
+    3. Filter: must start with a letter, pass stopword check, length ≥ 3
+    4. Sort remaining tokens by length descending → longer = more specific
+    5. Return the longest quality token, or "" if none found.
+
+    Examples:
+      "4-layer transformer"           → "transformer"   (not "-layer")
+      "sinusoidal positional encoding"→ "sinusoidal"
+      "Wall Street Journal (WSJ)..."  → ""              (all tokens are stopwords)
+      "multi-head attention"          → "attention"
+      "ResNet50"                      → "ResNet50"
+      "ViT-B/16"                      → "ViT"
+    """
+    # 1. Remove parenthetical content
+    clean = re.sub(r'\([^)]*\)', '', term).strip()
+    # 2. Split on whitespace and hyphens and slashes
+    tokens = re.split(r'[\s\-/]+', clean)
+    # 3. Filter quality tokens
+    quality = [
+        w for w in tokens
+        if len(w) >= 3
+        and w[0].isalpha()                          # must start with letter (no "-layer", "(WSJ)")
+        and w.lower() not in _STOPWORDS
+        and not (re.search(r'\d', w) and len(w) < 5)  # skip short numeric tokens like "4b"
+    ]
+    # 4. Return longest (most specific) token
+    if not quality:
+        return ""
+    return max(quality, key=len)
 
 
 class ArxivService:
@@ -79,10 +142,6 @@ class ArxivService:
         query:       str,
         max_results: int = 5,
     ) -> List[Dict]:
-        """
-        Search arXiv for papers related to query.
-        Returns list of paper dicts with title, abstract, authors, year, url.
-        """
         if not query or not query.strip():
             return []
 
@@ -94,13 +153,22 @@ class ArxivService:
             logger.debug(f"[ARXIV] cache hit query={query!r:.40}")
             return cached
 
-        loop    = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            _POOL, _search_arxiv, query, max_results
-        )
+        loop = asyncio.get_running_loop()
+        try:
+            results = await asyncio.wait_for(
+                loop.run_in_executor(_POOL, _search_arxiv, query, max_results),
+                timeout=25.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[ARXIV] timeout after 25s query='{query[:50]}'")
+            results = []
+        except Exception as e:
+            logger.warning(f"[ARXIV] executor error: {e}")
+            results = []
 
-        if results:
-            _cache[key] = (results, time.time())
+        # cache both hits (1hr) and misses (5min)
+        ttl = _CACHE_TTL if results else 300
+        _cache[key] = (results, time.time() - (_CACHE_TTL - ttl))
 
         return results
 
@@ -113,46 +181,68 @@ class ArxivService:
         title:       str = "",
         max_results: int = 5,
     ) -> List[Dict]:
-        _STOPWORDS = {
-            "the", "a", "an", "of", "for", "on", "in", "with",
-            "using", "based", "via", "and", "or", "to", "from",
-            "towards", "approach", "method", "model", "paper",
-            "research", "study", "analysis", "learning",
-            "arxiv", "ieee", "acm", "neurips", "icml", "iclr",
-            "transactions", "proceedings", "conference", "journal",
-            "retrieval", "augmented", "generation", 
-        }
-        parts = []
-        for term in models[:2]:
-            parts.extend([w for w in term.split() if w.lower() not in _STOPWORDS][:2])
-        for term in datasets[:2]:
-            parts.extend([w for w in term.split() if w.lower() not in _STOPWORDS][:2])
-        for term in methods[:1]:
-            parts.extend([w for w in term.split() if w.lower() not in _STOPWORDS][:2])
-        for term in tasks[:1]:
-            parts.extend([w for w in term.split() if w.lower() not in _STOPWORDS][:1])
+        """
+        Build a clean 3–4 token arXiv query from extracted entities.
 
-        # fallback to title only if nothing else
+        Token extraction rules:
+        - One best token per entity term (longest quality token after hyphen-split).
+        - Model terms take priority (up to 2 tokens).
+        - Dataset terms next (up to 1 token, hard to get useful signal from names).
+        - Method terms last (up to 1 token).
+        - Hard cap: 4 tokens total.
+        - Fallback to paper title if no entity tokens survive the filter.
+        """
+        parts: List[str] = []
+
+        # ── Models: up to 2 tokens ────────────────────────────────────────────
+        for term in models[:4]:          # sample more, filter aggressively
+            tok = _extract_best_token(term)
+            if tok and tok not in parts:
+                parts.append(tok)
+            if len(parts) >= 2:
+                break
+
+        # ── Datasets: up to 1 token ───────────────────────────────────────────
+        for term in datasets[:3]:
+            tok = _extract_best_token(term)
+            if tok and tok not in parts:
+                parts.append(tok)
+                break                    # one dataset token is enough
+
+        # ── Methods: up to 1 token ────────────────────────────────────────────
+        for term in methods[:2]:
+            tok = _extract_best_token(term)
+            if tok and tok not in parts:
+                parts.append(tok)
+                break
+
+        # ── Hard cap ─────────────────────────────────────────────────────────
+        parts = parts[:4]
+
+        # ── Fallback: use title if nothing survived ───────────────────────────
         if not parts and title:
-            clean_title = re.sub(r'^[a-f0-9]{32}_', '', title)  # strip MD5
+            clean_title = re.sub(r'^[a-f0-9]{32}_', '', title)
             clean_title = re.sub(r'\.pdf$', '', clean_title, flags=re.IGNORECASE)
-            clean_title = clean_title.replace('_', ' ').replace('-', ' ')
-            parts = [w for w in clean_title.split() 
-                    if w.lower() not in _STOPWORDS and len(w) > 3][:3]
+            clean_title = re.sub(r'[\-_]', ' ', clean_title)
+            parts = [
+                w for w in clean_title.split()
+                if len(w) > 3
+                and w[0].isalpha()
+                and w.lower() not in _STOPWORDS
+            ][:3]
 
-        parts = list(dict.fromkeys(parts))  # deduplicate preserving order
-        query = " ".join(parts).strip()[:80]
-        query = re.sub(r'\b\w\b', '', query).strip()
-
-        if not query:
+        if not parts:
             return []
+
+        query = " ".join(parts).strip()
+        logger.info(f"[ARXIV] entity query='{query}'")
         return await self.search(query, max_results)
 
     async def fetch_paper_details(self, arxiv_id: str) -> Optional[Dict]:
         """Fetch details for a specific arXiv paper by ID."""
         try:
             import arxiv
-            loop   = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
 
             def _fetch():
                 search = arxiv.Search(id_list=[arxiv_id])

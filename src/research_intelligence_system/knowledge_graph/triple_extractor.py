@@ -32,8 +32,8 @@ class TripleState(TypedDict):
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 def _get_llm(llm_id: str) -> ChatGroq:
-    _TRIPLE_MODEL = "openai/gpt-oss-20b"
-    return ChatGroq(model=_TRIPLE_MODEL, temperature=0, max_tokens=2000)
+    _TRIPLE_MODEL = "openai/gpt-oss-120b"   
+    return ChatGroq(model=_TRIPLE_MODEL, temperature=0, max_tokens=4000)
 
 
 # ── Text cleaning ─────────────────────────────────────────────────────────────
@@ -65,115 +65,100 @@ def _clean_text_for_triples(text: str) -> str:
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
-_TRIPLE_PROMPT = """You are an expert knowledge graph extraction system specialized in scientific literature.
+_TRIPLE_PROMPT = """[SYSTEM] You are a scientific knowledge graph construction engine. \
+Your sole output is a JSON array of knowledge triples extracted from a research paper. \
+You operate across all scientific domains: ML, NLP, biology, chemistry, physics, finance, medicine.
 
-Your task is to extract high-quality knowledge triples (subject, relation, object) from the given paper text.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — ENTITY INVENTORY (do this mentally before extraction)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+You have been given a pre-extracted entity list. Treat it as ground truth.
 
-The system must work across ALL domains (ML, biology, physics, finance, etc.) and produce precise, entity-grounded outputs.
+  Models / Algorithms : {models}
+  Datasets / Corpora  : {datasets}
+  Metrics             : {metrics}
+  Methods / Techniques: {methods}
 
-------------------------
-ALLOWED RELATIONS
-------------------------
-Use ONLY the following relation types:
+Rules for entity usage:
+- Use the EXACT string from the list above (same casing, same hyphenation).
+- Only invent an entity name if it clearly appears in the paper text AND is absent from all lists.
+- Never abbreviate or expand a known entity (e.g. do not write "BERT" if the list says "BERT-large").
 
-- TRAINED_ON        : model/method trained on dataset
-- EVALUATED_ON      : model evaluated on dataset/benchmark
-- ACHIEVES          : model achieves metric/result
-- USES              : method uses technique/component
-- IMPROVES_OVER     : method improves over baseline
-- PROPOSED_BY       : method proposed by authors
-- APPLIED_TO        : method applied to task/domain
-- COMPARED_WITH     : method compared with another
-- BASED_ON          : method based on architecture/theory
-- REPLACES          : method replaces older approach
-- OUTPERFORMS       : method outperforms another
-- BOUNDED_BY        : performance limited by theoretical bound
-- EXTENDS           : method extends or generalizes another
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — RELATION SELECTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use ONLY these 13 relation types. Selection rules are binding:
 
-------------------------
-KNOWN ENTITIES (HIGH PRIORITY)
-------------------------
-Models/Algorithms: {models}
-Datasets/Corpora:  {datasets}
-Metrics:           {metrics}
-Methods:           {methods}
+  TRAINED_ON      model/method was trained using a specific dataset or corpus
+  EVALUATED_ON    model/method was tested on a benchmark or held-out dataset
+  ACHIEVES        model reaches a named metric result  [object = metric NAME, not value]
+  USES            method incorporates a specific technique, module, or component
+  IMPROVES_OVER   method surpasses a baseline without a direct numeric comparison
+  PROPOSED_BY     method or model is introduced by named authors or a team
+  APPLIED_TO      method is deployed on a downstream task or domain
+  COMPARED_WITH   method is placed side-by-side with another (neutral, no winner implied)
+  BASED_ON        method is directly derived from or built upon a prior architecture/theory
+  REPLACES        method is a direct successor that supersedes an older approach
+  OUTPERFORMS     method beats another with an explicit numeric score in the paper
+  BOUNDED_BY      performance or capacity is constrained by a stated theoretical limit
+  EXTENDS         method broadens, generalises, or adds capability to an existing method
 
-STRICT RULE:
-→ ALWAYS prioritize using exact names from the known entities list.
-→ If missing, extract precise entity names directly from the paper text.
+Disambiguation rules — apply in order:
+  • OUTPERFORMS requires a quoted or tabulated numeric comparison in the source text.
+    If the paper only says "better than" without numbers → use IMPROVES_OVER instead.
+  • EXTENDS vs BASED_ON: use EXTENDS when new capability is added; BASED_ON when it is
+    a direct implementation or replication of prior work.
+  • USES vs BASED_ON: USES = one component among many; BASED_ON = the foundational architecture.
+  • ACHIEVES object must be the metric NAME only (e.g. "BLEU", "Top-1 Accuracy"), never a number.
 
-------------------------
-EXTRACTION RULES
-------------------------
-1. Use ONLY specific, concrete entity names
-   ❌ "proposed method"
-   ❌ "baseline model"
-   ✅ "TurboQuant"
-   ✅ "ViT-B/32"
-   ✅ "ResNet-50"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — EXTRACTION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VALID subjects and objects:
+  ✅ Specific named models, datasets, metrics, methods from the paper
+  ✅ Named theoretical concepts tied to a result (e.g. "Johnson-Lindenstrauss Lemma")
+  ✅ Named tasks when used as objects (e.g. "machine translation", "image classification")
 
-2. NEVER include:
-   - Mathematical formulas
-   - Symbols or variables
-   - Raw numbers as entities
+INVALID subjects and objects — reject these:
+  ✗ Placeholders          → "our method", "the proposed approach", "baseline model"
+  ✗ Raw numbers           → "0.923", "128", "3 layers"
+  ✗ Mathematical symbols  → "L2 norm", "∇θ", "σ(x)"
+  ✗ Partial phrases       → "deep learning", "neural network" (too generic)
+  ✗ Authors as objects    → do not create triples like "BERT PROPOSED_BY Devlin"
+    unless PROPOSED_BY is the primary contribution of the section
 
-3. Normalize entity naming:
-   - Keep consistent casing and formatting
-   - Do NOT paraphrase known entities
+Quantity:
+  • Target 10–25 triples. Hard stop at 25.
+  • Never pad to reach 10. Fewer precise triples are better than more vague ones.
+  • If the paper has fewer than 5 extractable facts, return what you find.
 
-4. Focus on:
-   - Model–dataset relationships
-   - Model–metric outcomes
-   - Method–technique dependencies
-   - Explicit comparisons and improvements
+Confidence scoring — use the exact anchors below:
+  1.0   The paper states this triple verbatim in text or a table.
+  0.9   The triple is the clear logical reading of an explicit sentence.
+  0.85  The triple is strongly implied by adjacent sentences in context.
+  0.75  The triple requires bridging two separate sections of the paper.
+  0.7   The triple is a reasonable inference but not directly stated.
+  (Do not use values outside 0.7–1.0. Do not use the same value for every triple.)
 
-5. For theory-heavy papers:
-   - Include: OUTPERFORMS, BOUNDED_BY, EXTENDS
+Deduplication:
+  • If two triples share the same (subject, relation, object) after lowercasing → keep only the higher-confidence one.
+  • Semantically identical triples with different surface forms count as duplicates.
 
-6. Avoid redundancy:
-   - No duplicate or semantically identical triples
-
-7. Confidence scoring:
-   - 0.9–1.0 → explicitly stated
-   - 0.8–0.9 → strongly implied
-   - 0.7–0.8 → weak but reasonable inference
-
-8. Quantity constraint:
-   - Extract between 10 and 40 triples
-
-9. Prefer high-signal triples over quantity
-
-------------------------
-DOMAIN-SPECIFIC HINTS
-------------------------
-- Quantization papers → TurboQuant, RabitQ, PQ, VQ, Lloyd-Max
-- Vision papers → ViT-B/32, ResNet variants, CLIP models
-- NLP papers → BERT, GPT variants, T5, RoBERTa
-
-------------------------
-INPUT PAPER
-------------------------
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INPUT PAPER TEXT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {text}
 
-------------------------
-OUTPUT FORMAT (STRICT)
-------------------------
-- Output MUST be a valid JSON array
-- NO markdown
-- NO explanations
-- NO extra text
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT — JSON ARRAY ONLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Return a single JSON array. No preamble, no markdown, no explanation.
+First character must be [  •  Last character must be ]
 
-Response MUST:
-- Start with [
-- End with ]
-
-Return ONLY this format:
 [
-  {{"subject": "entity name", "relation": "RELATION_TYPE", "object": "entity name", "confidence": 0.9}},
-  ...
-]
-
-"""
+  {{"subject": "ExactEntityName", "relation": "RELATION_TYPE", "object": "ExactEntityName", "confidence": 0.95}},
+  {{"subject": "ExactEntityName", "relation": "RELATION_TYPE", "object": "ExactEntityName", "confidence": 0.85}}
+]"""
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -213,16 +198,39 @@ def _extract_triples_node(state: TripleState) -> TripleState:
         raw      = response.content.strip()
         logger.info(f"[TRIPLES DEBUG] raw={raw[:300]}")
 
-        # find JSON array — handle cases where LLM adds text before/after
+        if not raw:
+            logger.warning(f"[TRIPLES] LLM returned empty response attempt {state['retry_count']+1}")
+            return {**state, "error": "empty response from LLM",
+                    "retry_count": state["retry_count"] + 1}
+
         start = raw.find('[')
-        end   = raw.rfind(']')
-        if start == -1 or end == -1 or end <= start:
+        if start == -1:
             raise ValueError("No JSON array found in response")
-        cleaned = raw[start:end+1]
+
+        end = raw.rfind(']')
+
+        # ── Bug 1 fix: handle truncated JSON (no closing ]) ───────────────
+        if end == -1 or end <= start:
+            logger.warning(f"[TRIPLES] response truncated — attempting partial recovery")
+            # find the last complete object: last occurrence of '}' before truncation
+            last_obj_end = raw.rfind('}')
+            if last_obj_end > start:
+                # reconstruct a valid array from whatever complete objects exist
+                partial = raw[start:last_obj_end + 1] + ']'
+                try:
+                    partial = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', partial)
+                    triples = json.loads(partial)
+                    logger.info(f"[TRIPLES] partial recovery: {len(triples)} triples from truncated response")
+                    return {**state, "triples": triples, "error": ""}
+                except Exception:
+                    pass  # fall through to retry
+            raise ValueError("Response truncated and partial recovery failed")
+        # ─────────────────────────────────────────────────────────────────
+
+        cleaned = raw[start:end + 1]
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
         triples = json.loads(cleaned)
         logger.info(f"[TRIPLES] extracted {len(triples)} triples")
-
         return {**state, "triples": triples, "error": ""}
 
     except Exception as e:
@@ -341,7 +349,7 @@ class TripleExtractor:
         loop = asyncio.get_running_loop()
         initial_state: TripleState = {
             "paper_id":    paper_id,
-            "llm_id":      "openai/gpt-oss-20b",  
+            "llm_id":      "openai/gpt-oss-120b",   # ← was gpt-oss-20b
             "sections":    sections,
             "entities":    entities,
             "triples":     [],
