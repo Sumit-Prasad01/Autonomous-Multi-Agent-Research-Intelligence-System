@@ -1,7 +1,6 @@
 """
 triple_extractor.py — LangGraph-based knowledge triple extraction agent
-Extracts (subject, relation, object) triples from paper text
-These triples are stored in both Postgres and Neo4j
+Extracts (subject, relation, object) triples from paper text.
 """
 from __future__ import annotations
 
@@ -32,35 +31,93 @@ class TripleState(TypedDict):
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
 def _get_llm(llm_id: str) -> ChatGroq:
-    _TRIPLE_MODEL = "openai/gpt-oss-120b"   
-    return ChatGroq(model=_TRIPLE_MODEL, temperature=0, max_tokens=4000)
+    return ChatGroq(model="openai/gpt-oss-120b", temperature=0, max_tokens=4000)
+
+
+# ── LaTeX subscript artifact cleaner ─────────────────────────────────────────
+# When PDFs contain LaTeX like "TurboQuant_{prod}", PDF parsers strip the braces
+# and subscript marker, leaving "TurboQuantprod". This contaminates the entity
+# list passed to the triple extraction prompt — the LLM sees "TurboQuantprod"
+# instead of "TurboQuant" and can't match it to entities in the paper text.
+_MATH_SUBSCRIPTS: frozenset = frozenset({
+    'prod', 'mse', 'mae', 'min', 'max', 'opt', 'est', 'ref',
+    'val', 'err', 'acc', 'lat', 'mem', 'out', 'init',
+})
+
+
+def _clean_entity_name(name: str) -> str:
+    """
+    Remove LaTeX subscript artifacts from entity names before triple extraction.
+
+    Examples:
+      "TurboQuantprod" → "TurboQuant"
+      "TurboQuantmse"  → "TurboQuant"
+      "VQprod"         → "VQ"
+      "ResNet50"       → "ResNet50"   (unchanged — digit suffix, not subscript)
+      "ViTBase"        → "ViTBase"    ('Base' not in math subscript set)
+      "BERT"           → "BERT"       (unchanged)
+    """
+    if not name or not name[0].isupper():
+        return name
+
+    for suffix in sorted(_MATH_SUBSCRIPTS, key=len, reverse=True):
+        if (name.lower().endswith(suffix)
+                and len(name) > len(suffix) + 1):
+            return name[:-len(suffix)]
+
+    return name
+
+
+def _clean_entity_list(entities: List[str]) -> List[str]:
+    """Apply _clean_entity_name to a list, deduplicate, preserve order."""
+    seen = set()
+    result = []
+    for e in entities:
+        cleaned = _clean_entity_name(e)
+        key = cleaned.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(cleaned)
+    return result
 
 
 # ── Text cleaning ─────────────────────────────────────────────────────────────
 _MATH_NOISE = re.compile(
-    r'(\\[a-zA-Z]+\{[^}]*\}|'      # LaTeX: \frac{}, \sum{}
-    r'\$[^$]*\$|'                   # inline math $...$
-    r'\\\([^)]*\\\)|'               # \( ... \)
-    r'(?:\d+\s*[\+\-\*/]\s*){3,}|' # repeated arithmetic
-    r'(\d+\s*){5,}|'               # long number sequences
-    r'[\+\-\*/=<>]{3,}|'           # symbol runs
-    r'exp\s*\([^)]*\)\s*[\.\,]?)',  # exp(...) patterns
+    r'(\\[a-zA-Z]+\{[^}]*\}|'       # LaTeX: \frac{}, \sum{}
+    r'\$[^$]*\$|'                    # inline math: $...$
+    r'\\\([^)]*\\\)|'                # \( ... \)
+    r'(?:\d+\s*[\+\-\*/]\s*){3,}|'  # repeated arithmetic
+    r'(?<!\w)(\d+\s*){6,}(?!\w)|'   # long number sequences
+    r'[\+\-\*/=<>]{3,}|'            # symbol runs
+    r'exp\s*\([^)]*\)\s*[\.\,]?)',   # exp(...) patterns
     re.DOTALL,
 )
 
+
 def _clean_text_for_triples(text: str) -> str:
-    """Remove math formulas, LaTeX, and noise before triple extraction."""
+    """
+    Remove math formulas while preserving result table rows.
+    Result rows like "Transformer (big) | 41.0 | 27.3" are kept because
+    they contain at least 2 word-like tokens (Transformer, big).
+    Pure symbol/number lines like "= = = =" are stripped.
+    """
     text = _MATH_NOISE.sub(' ', text)
-    text = re.sub(r'(\.\s*){3,}', ' ', text)       # ellipsis sequences
-    text = re.sub(r'\s{2,}', ' ', text)             # collapse whitespace
-    text = re.sub(r'\n{2,}', '\n', text)            # collapse newlines
-    # remove lines that are >50% digits/symbols (formula-heavy lines)
+    text = re.sub(r'(\.\s*){3,}', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    text = re.sub(r'\n{2,}', '\n', text)
+
     lines = []
     for line in text.split('\n'):
-        if len(line) > 10:
-            non_alpha = sum(1 for c in line if not c.isalpha() and not c.isspace())
-            if non_alpha / len(line) < 0.65:
-                lines.append(line)
+        stripped = line.strip()
+        if not stripped:
+            continue
+        word_like = [w for w in re.split(r'[\s|,;:\-]+', stripped)
+                     if sum(c.isalpha() for c in w) >= 2]
+        if len(word_like) >= 2:
+            lines.append(stripped)
+        elif len(stripped) < 100 and any(c.isalpha() for c in stripped):
+            lines.append(stripped)
+
     return '\n'.join(lines).strip()
 
 
@@ -70,79 +127,69 @@ Your sole output is a JSON array of knowledge triples extracted from a research 
 You operate across all scientific domains: ML, NLP, biology, chemistry, physics, finance, medicine.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STEP 1 — ENTITY INVENTORY (do this mentally before extraction)
+STEP 1 — ENTITY INVENTORY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-You have been given a pre-extracted entity list. Treat it as ground truth.
+Pre-extracted entities — treat as ground truth:
 
   Models / Algorithms : {models}
   Datasets / Corpora  : {datasets}
   Metrics             : {metrics}
   Methods / Techniques: {methods}
 
-Rules for entity usage:
-- Use the EXACT string from the list above (same casing, same hyphenation).
-- Only invent an entity name if it clearly appears in the paper text AND is absent from all lists.
-- Never abbreviate or expand a known entity (e.g. do not write "BERT" if the list says "BERT-large").
+Rules:
+• Use the EXACT string from the list above.
+• Only invent a name if it clearly appears in the paper AND is absent from all lists.
+• Never abbreviate or expand a known entity.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 2 — RELATION SELECTION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Use ONLY these 13 relation types. Selection rules are binding:
+Use ONLY these 13 relation types:
 
-  TRAINED_ON      model/method was trained using a specific dataset or corpus
-  EVALUATED_ON    model/method was tested on a benchmark or held-out dataset
-  ACHIEVES        model reaches a named metric result  [object = metric NAME, not value]
-  USES            method incorporates a specific technique, module, or component
-  IMPROVES_OVER   method surpasses a baseline without a direct numeric comparison
-  PROPOSED_BY     method or model is introduced by named authors or a team
-  APPLIED_TO      method is deployed on a downstream task or domain
-  COMPARED_WITH   method is placed side-by-side with another (neutral, no winner implied)
-  BASED_ON        method is directly derived from or built upon a prior architecture/theory
-  REPLACES        method is a direct successor that supersedes an older approach
-  OUTPERFORMS     method beats another with an explicit numeric score in the paper
-  BOUNDED_BY      performance or capacity is constrained by a stated theoretical limit
-  EXTENDS         method broadens, generalises, or adds capability to an existing method
+  TRAINED_ON      model was trained on a dataset
+  EVALUATED_ON    model was tested on a benchmark
+  ACHIEVES        model reaches a result on a metric or benchmark
+  USES            method incorporates a technique or component
+  IMPROVES_OVER   method surpasses a baseline (no numeric comparison needed)
+  PROPOSED_BY     method introduced by named authors
+  APPLIED_TO      method deployed on a task or domain
+  COMPARED_WITH   method compared with another (neutral)
+  BASED_ON        method derived from prior architecture/theory
+  REPLACES        method supersedes an older approach
+  OUTPERFORMS     method beats another WITH explicit numeric evidence
+  BOUNDED_BY      performance constrained by a theoretical limit
+  EXTENDS         method broadens or generalises an existing method
 
-Disambiguation rules — apply in order:
-  • OUTPERFORMS requires a quoted or tabulated numeric comparison in the source text.
-    If the paper only says "better than" without numbers → use IMPROVES_OVER instead.
-  • EXTENDS vs BASED_ON: use EXTENDS when new capability is added; BASED_ON when it is
-    a direct implementation or replication of prior work.
-  • USES vs BASED_ON: USES = one component among many; BASED_ON = the foundational architecture.
-  • ACHIEVES object must be the metric NAME only (e.g. "BLEU", "Top-1 Accuracy"), never a number.
+Disambiguation:
+• OUTPERFORMS requires a numeric score in the text. Otherwise use IMPROVES_OVER.
+• EXTENDS = new capability added. BASED_ON = direct implementation of prior work.
+• USES = one component. BASED_ON = foundational architecture.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STEP 3 — EXTRACTION RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-VALID subjects and objects:
-  ✅ Specific named models, datasets, metrics, methods from the paper
-  ✅ Named theoretical concepts tied to a result (e.g. "Johnson-Lindenstrauss Lemma")
-  ✅ Named tasks when used as objects (e.g. "machine translation", "image classification")
 
-INVALID subjects and objects — reject these:
-  ✗ Placeholders          → "our method", "the proposed approach", "baseline model"
-  ✗ Raw numbers           → "0.923", "128", "3 layers"
-  ✗ Mathematical symbols  → "L2 norm", "∇θ", "σ(x)"
-  ✗ Partial phrases       → "deep learning", "neural network" (too generic)
-  ✗ Authors as objects    → do not create triples like "BERT PROPOSED_BY Devlin"
-    unless PROPOSED_BY is the primary contribution of the section
+ACHIEVES — most important relation for KG utility:
+  Include the numeric score in the object when it appears in the text.
+  Format: "<score> <metric> on <dataset>"
+  ✅ "TurboQuant ACHIEVES 41.0 BLEU on WMT 2014 EN-FR"
+  ✅ "BERT ACHIEVES 93.2% F1 on SQuAD"
+  ✅ "TurboQuant ACHIEVES Recall@1"   ← acceptable when no score in text
 
-Quantity:
-  • Target 10–25 triples. Hard stop at 25.
-  • Never pad to reach 10. Fewer precise triples are better than more vague ones.
-  • If the paper has fewer than 5 extractable facts, return what you find.
+VALID subjects/objects:
+  ✅ Named models, datasets, metrics, methods from entity list
+  ✅ Named tasks: "machine translation", "image classification"
+  ✅ ACHIEVES objects with numeric score: "28.4 BLEU on WMT 2014 EN-DE"
 
-Confidence scoring — use the exact anchors below:
-  1.0   The paper states this triple verbatim in text or a table.
-  0.9   The triple is the clear logical reading of an explicit sentence.
-  0.85  The triple is strongly implied by adjacent sentences in context.
-  0.75  The triple requires bridging two separate sections of the paper.
-  0.7   The triple is a reasonable inference but not directly stated.
-  (Do not use values outside 0.7–1.0. Do not use the same value for every triple.)
+INVALID — reject:
+  ✗ Placeholders: "our method", "the proposed approach"
+  ✗ Bare numbers: "0.923", "128" (but "28.4 BLEU" is valid — has metric name)
+  ✗ Math symbols: "∇θ", "σ(x)", "L2 norm"
+  ✗ Overly generic: "deep learning", "neural network"
 
-Deduplication:
-  • If two triples share the same (subject, relation, object) after lowercasing → keep only the higher-confidence one.
-  • Semantically identical triples with different surface forms count as duplicates.
+Quantity: 15–25 triples, hard stop at 25. Prioritise ACHIEVES triples.
+Confidence: 1.0=verbatim, 0.9=explicit sentence, 0.85=implied, 0.75=bridged, 0.7=inferred.
+Deduplication: same (subject, relation, object) lowercased → keep higher confidence only.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 INPUT PAPER TEXT
@@ -152,43 +199,54 @@ INPUT PAPER TEXT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT — JSON ARRAY ONLY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Return a single JSON array. No preamble, no markdown, no explanation.
-First character must be [  •  Last character must be ]
-
 [
-  {{"subject": "ExactEntityName", "relation": "RELATION_TYPE", "object": "ExactEntityName", "confidence": 0.95}},
-  {{"subject": "ExactEntityName", "relation": "RELATION_TYPE", "object": "ExactEntityName", "confidence": 0.85}}
+  {{"subject": "ModelName", "relation": "ACHIEVES", "object": "41.0 BLEU on WMT 2014 EN-FR", "confidence": 1.0}},
+  {{"subject": "ModelName", "relation": "USES", "object": "multi-head attention", "confidence": 0.9}}
 ]"""
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 def _extract_triples_node(state: TripleState) -> TripleState:
-    """Extract knowledge triples using LLM."""
     logger.info(f"[TRIPLES] paper_id={state['paper_id']} attempt={state['retry_count']+1}")
 
     sections = state["sections"]
     entities = state.get("entities", {})
 
-    # combine most informative sections — trim aggressively
+    # Clean LaTeX subscript artifacts from entity names before building the prompt.
+    # "TurboQuantprod" → "TurboQuant" so the LLM can match entities in the paper text.
+    clean_models   = _clean_entity_list(entities.get("models",   [])[:12])
+    clean_datasets = _clean_entity_list(entities.get("datasets", [])[:12])
+    clean_metrics  = _clean_entity_list(entities.get("metrics",  [])[:12])
+    clean_methods  = _clean_entity_list(entities.get("methods",  [])[:12])
+
+    if any(len(orig) != len(clean) for orig, clean in [
+        (entities.get("models", [])[:12],   clean_models),
+        (entities.get("datasets", [])[:12], clean_datasets),
+    ]):
+        logger.info("[TRIPLES] entity names cleaned (LaTeX subscript artifacts removed)")
+
+    # Section allocation: results first (scores live here)
     raw_text = " ".join([
-        sections.get("abstract",     "")[:1500],
-        sections.get("introduction", "")[:1800],  # ADD THIS — clean entity text
-        sections.get("results",      "")[:2500],  # INCREASE — comparisons live here
-        sections.get("methodology",  "")[:1200],   # REDUCE — mostly math
-        sections.get("conclusion",   "")[:1000],
+        sections.get("results",      "")[:3500],
+        sections.get("methodology",  "")[:1500],
+        sections.get("abstract",     "")[:1000],
+        sections.get("conclusion",   "")[:800],
+        sections.get("introduction", "")[:700],
     ]).strip()
 
-    text = _clean_text_for_triples(raw_text)[:3500]
+    text = _clean_text_for_triples(raw_text)[:5000]
 
     if len(text) < 80:
         logger.warning(f"[TRIPLES] text too noisy after cleaning paper_id={state['paper_id']}")
         return {**state, "triples": [], "error": "text too noisy after cleaning"}
 
+    logger.info(f"[TRIPLES] input text: {len(text)} chars after cleaning")
+
     prompt = _TRIPLE_PROMPT.format(
-        models   = ", ".join(entities.get("models",   [])[:12]) or "none identified",
-        datasets = ", ".join(entities.get("datasets", [])[:12]) or "none identified",
-        metrics  = ", ".join(entities.get("metrics",  [])[:12]) or "none identified",
-        methods  = ", ".join(entities.get("methods",  [])[:12]) or "none identified",
+        models   = ", ".join(clean_models)   or "none identified",
+        datasets = ", ".join(clean_datasets) or "none identified",
+        metrics  = ", ".join(clean_metrics)  or "none identified",
+        methods  = ", ".join(clean_methods)  or "none identified",
         text     = text,
     )
 
@@ -199,7 +257,7 @@ def _extract_triples_node(state: TripleState) -> TripleState:
         logger.info(f"[TRIPLES DEBUG] raw={raw[:300]}")
 
         if not raw:
-            logger.warning(f"[TRIPLES] LLM returned empty response attempt {state['retry_count']+1}")
+            logger.warning(f"[TRIPLES] empty response attempt {state['retry_count']+1}")
             return {**state, "error": "empty response from LLM",
                     "retry_count": state["retry_count"] + 1}
 
@@ -209,23 +267,19 @@ def _extract_triples_node(state: TripleState) -> TripleState:
 
         end = raw.rfind(']')
 
-        # ── Bug 1 fix: handle truncated JSON (no closing ]) ───────────────
         if end == -1 or end <= start:
-            logger.warning(f"[TRIPLES] response truncated — attempting partial recovery")
-            # find the last complete object: last occurrence of '}' before truncation
+            logger.warning("[TRIPLES] response truncated — attempting partial recovery")
             last_obj_end = raw.rfind('}')
             if last_obj_end > start:
-                # reconstruct a valid array from whatever complete objects exist
                 partial = raw[start:last_obj_end + 1] + ']'
                 try:
-                    partial = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', partial)
-                    triples = json.loads(partial)
-                    logger.info(f"[TRIPLES] partial recovery: {len(triples)} triples from truncated response")
+                    partial  = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', partial)
+                    triples  = json.loads(partial)
+                    logger.info(f"[TRIPLES] partial recovery: {len(triples)} triples")
                     return {**state, "triples": triples, "error": ""}
                 except Exception:
-                    pass  # fall through to retry
+                    pass
             raise ValueError("Response truncated and partial recovery failed")
-        # ─────────────────────────────────────────────────────────────────
 
         cleaned = raw[start:end + 1]
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
@@ -235,20 +289,21 @@ def _extract_triples_node(state: TripleState) -> TripleState:
 
     except Exception as e:
         logger.warning(f"[TRIPLES] extraction failed attempt {state['retry_count']+1}: {e}")
-        return {
-            **state,
-            "error":       str(e),
-            "retry_count": state["retry_count"] + 1,
-        }
+        return {**state, "error": str(e), "retry_count": state["retry_count"] + 1}
 
 
 def _validate_triples_node(state: TripleState) -> TripleState:
-    """Validate, clean, and deduplicate extracted triples."""
     triples = state.get("triples", [])
     valid   = []
 
-    # regex to detect math/formula strings
-    _is_formula = re.compile(r'^[\d\s\+\-\*/=<>\.\\{}()\[\]]+$')
+    _is_pure_formula = re.compile(r'^[\d\s\+\-\*/=<>\.\\{}()\[\]|,;:]+$')
+
+    valid_relations = {
+        "TRAINED_ON", "EVALUATED_ON", "ACHIEVES", "USES",
+        "IMPROVES_OVER", "PROPOSED_BY", "APPLIED_TO",
+        "COMPARED_WITH", "BASED_ON", "REPLACES",
+        "OUTPERFORMS", "BOUNDED_BY", "EXTENDS",
+    }
 
     for t in triples:
         if not isinstance(t, dict):
@@ -258,32 +313,20 @@ def _validate_triples_node(state: TripleState) -> TripleState:
         relation = str(t.get("relation", "")).strip().upper()
         obj      = str(t.get("object",   "")).strip()
 
-        # skip incomplete
         if not subject or not relation or not obj:
             continue
         if len(subject) < 2 or len(obj) < 2:
             continue
-        # skip self-referential
         if subject.lower() == obj.lower():
             continue
-        # skip formula subjects/objects
-        if _is_formula.match(subject) or _is_formula.match(obj):
+        if _is_pure_formula.match(subject) or _is_pure_formula.match(obj):
             continue
-        # skip if subject or object is just digits
-        if subject.replace(' ', '').isdigit() or obj.replace(' ', '').isdigit():
+        if re.sub(r'[\d\s\.]', '', subject) == '' or re.sub(r'[\d\s\.]', '', obj) == '':
             continue
-        # skip unknown relation types
-        valid_relations = {
-            "TRAINED_ON", "EVALUATED_ON", "ACHIEVES", "USES",
-            "IMPROVES_OVER", "PROPOSED_BY", "APPLIED_TO",
-            "COMPARED_WITH", "BASED_ON", "REPLACES",
-            "OUTPERFORMS", "BOUNDED_BY", "EXTENDS",  
-        }
         if relation not in valid_relations:
             continue
 
-        confidence = float(t.get("confidence", 0.8))
-        confidence = max(0.0, min(1.0, confidence))
+        confidence = max(0.0, min(1.0, float(t.get("confidence", 0.8))))
 
         valid.append({
             "subject":    subject,
@@ -292,7 +335,6 @@ def _validate_triples_node(state: TripleState) -> TripleState:
             "confidence": confidence,
         })
 
-    # deduplicate — case-insensitive on subject + object
     seen   = set()
     unique = []
     for t in valid:
@@ -301,37 +343,34 @@ def _validate_triples_node(state: TripleState) -> TripleState:
             seen.add(key)
             unique.append(t)
 
-    # sort by confidence descending
-    unique.sort(key=lambda x: x["confidence"], reverse=True)
+    # ACHIEVES first (most valuable), then by confidence descending
+    unique.sort(key=lambda x: (0 if x["relation"] == "ACHIEVES" else 1, -x["confidence"]))
 
+    achieves_count = sum(1 for t in unique if t["relation"] == "ACHIEVES")
     logger.info(
-        f"[TRIPLES] validated: {len(unique)} unique triples "
-        f"from {len(triples)} raw"
+        f"[TRIPLES] validated: {len(unique)} unique triples from {len(triples)} raw "
+        f"(ACHIEVES={achieves_count})"
     )
     return {**state, "triples": unique}
 
 
-# ── Conditional edges ─────────────────────────────────────────────────────────
+# ── Graph ─────────────────────────────────────────────────────────────────────
 def _should_retry(state: TripleState) -> str:
     if state.get("error") and state["retry_count"] < 2:
         return "extract"
     return "validate"
 
 
-# ── Graph ─────────────────────────────────────────────────────────────────────
 def _build_graph() -> Any:
     graph = StateGraph(TripleState)
-
     graph.add_node("extract",  _extract_triples_node)
     graph.add_node("validate", _validate_triples_node)
-
     graph.set_entry_point("extract")
     graph.add_conditional_edges("extract", _should_retry, {
         "extract":  "extract",
         "validate": "validate",
     })
     graph.add_edge("validate", END)
-
     return graph.compile()
 
 
@@ -344,19 +383,20 @@ class TripleExtractor:
     def __init__(self, llm_id: str = "llama-3.3-70b-versatile"):
         self.llm_id = llm_id
 
-    async def extract(self, paper_id, sections, entities):
-        await wait_for_groq("openai/gpt-oss-20b", "triples")
+    async def extract(self, paper_id: str, sections: Dict, entities: Dict) -> List[Dict]:
+        await wait_for_groq("openai/gpt-oss-120b", "triples")
+
         loop = asyncio.get_running_loop()
         initial_state: TripleState = {
             "paper_id":    paper_id,
-            "llm_id":      "openai/gpt-oss-120b",   # ← was gpt-oss-20b
+            "llm_id":      "openai/gpt-oss-120b",
             "sections":    sections,
             "entities":    entities,
             "triples":     [],
             "retry_count": 0,
             "error":       "",
         }
-        result = await loop.run_in_executor(None, lambda: _graph.invoke(initial_state))
+        result  = await loop.run_in_executor(None, lambda: _graph.invoke(initial_state))
         triples = result.get("triples", [])
         if not triples:
             logger.warning(f"[TRIPLES] no triples extracted for paper_id={paper_id}")

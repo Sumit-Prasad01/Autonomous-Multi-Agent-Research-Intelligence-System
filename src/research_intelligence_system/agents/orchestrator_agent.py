@@ -2,6 +2,25 @@
 orchestrator_agent.py — LangGraph-based orchestrator
 Runs all agents in correct order for each paper, then cross-paper agents.
 Per-paper agents run in parallel across multiple papers.
+
+── THROTTLING ARCHITECTURE ───────────────────────────────────────────────────
+Agents fall into two categories:
+
+SELF-THROTTLING (handle wait + notify internally per node):
+  CriticAgent      — each node calls sync_wait_for_groq + notify_groq_complete
+  ComparisonAgent  — _compare_node calls sync_wait_for_groq + notify_groq_complete
+  LiteratureReviewAgent — each node calls sync_wait_for_groq + notify_groq_complete
+
+PUBLIC-METHOD THROTTLING (call wait_for_groq in public method, ONE call):
+  ExtractionAgent  — wait_for_groq in .extract()
+  SummarizerAgent  — wait_for_groq in .summarize()
+  TripleExtractor  — wait_for_groq in .extract()
+  GapDetectionAgent — wait_for_groq in .detect()
+
+For public-method agents, the orchestrator MUST call notify_groq_complete()
+after the await returns. This updates _last_call from "before LLM" to "after LLM".
+For self-throttling agents, the orchestrator must NOT call notify_groq_complete().
+─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
@@ -18,6 +37,7 @@ from src.research_intelligence_system.agents.gap_detection_agent import GapDetec
 from src.research_intelligence_system.agents.literature_review_agent import LiteratureReviewAgent
 from src.research_intelligence_system.agents.summarizer_agent import SummarizerAgent
 from src.research_intelligence_system.constants import COLLECTION_NAME
+from src.research_intelligence_system.core.groq_limiter import notify_groq_complete
 from src.research_intelligence_system.database.paper_repository import (
     get_paper_analyses, get_paper_analysis,
     save_comparison, save_critic_output, save_entities,
@@ -41,8 +61,8 @@ logger = get_logger(__name__)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-_ARXIV_DELAY   = 5    # seconds between arXiv calls to avoid 429
-_QDRANT_LIMIT  = 200  # max chunks to fetch per paper
+_ARXIV_DELAY  = 5    # seconds between arXiv calls to avoid 429
+_QDRANT_LIMIT = 200  # max chunks to fetch per paper
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -60,10 +80,7 @@ class OrchestratorState(TypedDict):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 async def _fetch_sections(chat_id: str) -> Dict[str, str]:
-    """
-    Fetch paper chunks from Qdrant and group by section.
-    Returns {section_name: joined_text} truncated to 3000 chars each.
-    """
+    """Fetch paper chunks from Qdrant and group by section."""
     results, _ = _store.client.scroll(
         collection_name=COLLECTION_NAME,
         scroll_filter=Filter(must=[FieldCondition(
@@ -94,7 +111,7 @@ async def _fetch_similar_papers(
     entities: Dict[str, Any],
     filename: str,
 ) -> List[Dict]:
-    """Fetch similar papers using entity-based query — not filename."""
+    """Fetch similar papers using entity-based query."""
     try:
         arxiv   = ArxivService()
         similar = await arxiv.search_by_entities(
@@ -120,42 +137,41 @@ async def _run_single_paper(
     db:       AsyncSession,
 ) -> Dict[str, Any]:
     """
-    Full per-paper agent pipeline:
-    Stage 3: Entity extraction
-    Stage 4: Two-stage summarization (BART + LLM)
-    Stage 5: Critic self-reflection
-    Stage 6: Triple extraction
-    Stage 7: Neo4j graph construction
-    Stage 8: Similar papers (arXiv)
-    Stage 9: Research gap detection
+    Full per-paper agent pipeline.
+    notify_groq_complete() is called after every public-method-throttled agent.
+    Self-throttling agents (critic) do NOT get an orchestrator-level notify.
     """
     logger.info(f"[ORCHESTRATOR] starting paper_id={paper_id}")
     await set_analysis_status(db, paper_id, "running")
 
     try:
-        # validate paper exists
         paper = await get_paper_analysis(db, paper_id)
         if not paper:
             raise ValueError(f"PaperAnalysis not found: {paper_id}")
 
-        # fetch sections from Qdrant
         sections_text = await _fetch_sections(chat_id)
         if not sections_text:
             raise ValueError(f"No sections found in Qdrant for chat_id={chat_id}")
 
         # ── Stage 3: Entity Extraction ────────────────────────────────────────
+        # ExtractionAgent throttles via public method (wait_for_groq in .extract())
         logger.info(f"[ORCHESTRATOR] extraction paper_id={paper_id}")
         entities = await ExtractionAgent(llm_id=llm_id).extract(paper_id, sections_text)
+        notify_groq_complete()   # ← update _last_call after LLM responded
         await save_entities(db, paper_id, entities)
 
         # ── Stage 4: Two-stage Summarization ─────────────────────────────────
+        # SummarizerAgent throttles via public method
         logger.info(f"[ORCHESTRATOR] summarization paper_id={paper_id}")
         summaries = await SummarizerAgent(llm_id=llm_id).summarize(
             paper_id, sections_text, entities
         )
+        notify_groq_complete()   # ← update _last_call after LLM responded
         await save_summaries(db, paper_id, summaries)
 
         # ── Stage 5: Critic Self-reflection ──────────────────────────────────
+        # CriticAgent is SELF-THROTTLING — nodes call sync_wait + notify internally.
+        # DO NOT call notify_groq_complete() here.
         logger.info(f"[ORCHESTRATOR] critic paper_id={paper_id}")
         critic_summaries = {
             **summaries,
@@ -163,7 +179,7 @@ async def _run_single_paper(
         }
         critic_result = await CriticAgent(llm_id=llm_id).evaluate(
             paper_id, critic_summaries, entities,
-            chunks=list(sections_text.values()), 
+            chunks=list(sections_text.values()),
         )
         await save_critic_output(
             db, paper_id,
@@ -172,7 +188,9 @@ async def _run_single_paper(
             missing_entities = critic_result["missing_entities"],
             critic_validated = critic_result["critic_validated"],
         )
+
         # ── Stage 5b: Hallucination Detection ────────────────────────────────
+        # Uses cross-encoder (CPU/GPU) — no LLM call, no throttling needed.
         logger.info(f"[ORCHESTRATOR] hallucination detection paper_id={paper_id}")
         try:
             chunks      = list(sections_text.values())
@@ -194,26 +212,25 @@ async def _run_single_paper(
             logger.warning(f"[ORCHESTRATOR] hallucination detection failed (non-fatal): {e}")
 
         # ── Stage 6: Triple Extraction ────────────────────────────────────────
+        # TripleExtractor throttles via public method
         logger.info(f"[ORCHESTRATOR] triples paper_id={paper_id}")
         triples = await TripleExtractor(llm_id=llm_id).extract(
             paper_id, sections_text, entities
         )
+        notify_groq_complete()   # ← update _last_call after LLM responded
         await save_triples(db, paper_id, chat_id, triples)
 
         # ── Stage 6b: Triple Faithfulness Filter ─────────────────────────────
+        # Cross-encoder only — no LLM call, no throttling needed.
         logger.info(f"[ORCHESTRATOR] triple faithfulness filter paper_id={paper_id}")
         try:
-            from src.research_intelligence_system.agents.hallucination_detector import (
-                filter_triples_by_faithfulness
-            )
-            chunks = list(sections_text.values())
+            chunks        = list(sections_text.values())
             triple_result = await filter_triples_by_faithfulness(triples, chunks)
-            triples = triple_result["filtered_triples"]
+            triples       = triple_result["filtered_triples"]
             logger.info(
                 f"[TRIPLE FILTER] kept={triple_result['kept_count']} "
                 f"removed={triple_result['removed_count']}"
             )
-            # re-save filtered triples
             await save_triples(db, paper_id, chat_id, triples)
         except Exception as e:
             logger.warning(f"[ORCHESTRATOR] triple filter failed (non-fatal): {e}")
@@ -229,20 +246,23 @@ async def _run_single_paper(
             logger.warning(f"[ORCHESTRATOR] graph build failed (non-fatal): {e}")
 
         # ── Stage 8: Similar Papers (arXiv) ──────────────────────────────────
+        # HTTP I/O only — no LLM call, no throttling needed.
         logger.info(f"[ORCHESTRATOR] fetching similar papers paper_id={paper_id}")
         similar = await _fetch_similar_papers(entities, paper.filename or "")
         await save_similar_papers(db, paper_id, similar)
 
-        # ── Stage 9: Research Gap Detection ──────────────────────────────────────────
+        # ── Stage 9: Research Gap Detection ──────────────────────────────────
+        # GapDetectionAgent throttles via public method
         logger.info(f"[ORCHESTRATOR] gap detection paper_id={paper_id}")
-        gap_result = None   # ← initialize before try block
+        gap_result = None
         try:
             gap_result = await GapDetectionAgent(llm_id=llm_id).detect(
-                chat_id=chat_id,
-                paper_id=paper_id,
-                entities=entities,
-                similar_papers=similar,
+                chat_id       = chat_id,
+                paper_id      = paper_id,
+                entities      = entities,
+                similar_papers = similar,
             )
+            notify_groq_complete()   # ← update _last_call after LLM responded
             await save_gaps(
                 db, paper_id,
                 research_gaps     = gap_result["research_gaps"],
@@ -253,20 +273,19 @@ async def _run_single_paper(
         except Exception as e:
             logger.warning(f"[ORCHESTRATOR] gap detection failed (non-fatal): {e}")
 
-        # ── Stage 9b: Gap Evidence Faithfulness ──────────────────────────────────────
-        if gap_result:   # ← only run if Stage 9 succeeded
+        # ── Stage 9b: Gap Evidence Faithfulness ──────────────────────────────
+        # Cross-encoder only — no LLM call, no throttling needed.
+        if gap_result:
             logger.info(f"[ORCHESTRATOR] gap evidence scoring paper_id={paper_id}")
             try:
-                from src.research_intelligence_system.agents.hallucination_detector import (
-                    score_gap_evidence
-                )
                 chunks     = list(sections_text.values())
                 gap_scored = await score_gap_evidence(
                     gap_result["research_gaps"], chunks
                 )
                 gap_result["research_gaps"] = gap_scored["scored_gaps"]
                 logger.info(
-                    f"[GAP FILTER] low_confidence={gap_scored['low_confidence_count']}"
+                    f"[GAP FILTER] scored={len(gap_scored['scored_gaps'])} "
+                    f"low_confidence={gap_scored['low_confidence_count']}"
                 )
                 await save_gaps(
                     db, paper_id,
@@ -298,7 +317,6 @@ async def _run_single_paper(
 
 # ── Orchestrator nodes ────────────────────────────────────────────────────────
 def _detect_task_node(state: OrchestratorState) -> OrchestratorState:
-    """Detect task type based on paper count."""
     count = len(state["paper_ids"])
     task  = "single_paper_with_web" if count == 1 else "multi_paper_comparison"
     logger.info(f"[ORCHESTRATOR] task={task} papers={count}")
@@ -309,7 +327,6 @@ async def _run_per_paper_node(
     state: OrchestratorState,
     db:    AsyncSession,
 ) -> OrchestratorState:
-    """Run all per-paper agents in parallel across all papers."""
     logger.info(f"[ORCHESTRATOR] running {state['paper_count']} papers in parallel")
 
     results_list = await asyncio.gather(*[
@@ -337,10 +354,13 @@ async def _run_comparison_node(
     state: OrchestratorState,
     db:    AsyncSession,
 ) -> OrchestratorState:
-    """Cross-paper comparison — web-augmented or direct."""
+    """
+    Cross-paper comparison.
+    ComparisonAgent is SELF-THROTTLING (_compare_node handles wait + notify).
+    DO NOT call notify_groq_complete() here.
+    The asyncio.sleep(3) is also removed — the limiter's 4s gap handles spacing.
+    """
     logger.info(f"[ORCHESTRATOR] comparison type={state['current_step']}")
-
-    await asyncio.sleep(3)
 
     try:
         analyses   = await get_paper_analyses(db, state["chat_id"])
@@ -355,7 +375,7 @@ async def _run_comparison_node(
             paper_ids        = [str(a.id) for a in analyses],
             comparison_type  = "web_augmented" if len(analyses) == 1 else "direct",
             comparison_table = comparison.get("comparison_table", {}),
-            ranking          = comparison.get("ranking", []),
+            ranking          = comparison.get("ranking", ""),
             evolution_trends = comparison.get("evolution_trends", ""),
             positioning      = comparison.get("positioning", ""),
             web_papers_used  = comparison.get("web_papers_used", []),
@@ -365,16 +385,16 @@ async def _run_comparison_node(
     except Exception as e:
         logger.warning(f"[ORCHESTRATOR] comparison failed (non-fatal): {e}")
         return {**state, "comparison": {}}
-    
+
 
 async def _run_cross_paper_gaps_node(
     state: OrchestratorState,
     db:    AsyncSession,
 ) -> OrchestratorState:
-    """Detect gaps across all papers in this chat."""
+    """Detect gaps across all papers in this chat (multi-paper only)."""
     if state["paper_count"] < 2:
         return {**state, "cross_paper_gaps": {}}
-    
+
     logger.info("[ORCHESTRATOR] cross-paper gap detection")
     try:
         from src.research_intelligence_system.agents.cross_paper_gap_detection import (
@@ -386,9 +406,7 @@ async def _run_cross_paper_gaps_node(
             paper_analyses = analyses,
             llm_id         = state["llm_id"],
         )
-        logger.info(
-            f"[CROSS GAP] {len(result['cross_paper_gaps'])} gaps found"
-        )
+        logger.info(f"[CROSS GAP] {len(result.get('cross_paper_gaps', []))} gaps found")
         return {**state, "cross_paper_gaps": result}
     except Exception as e:
         logger.warning(f"[ORCHESTRATOR] cross-paper gaps failed (non-fatal): {e}")
@@ -399,7 +417,11 @@ async def _run_literature_review_node(
     state: OrchestratorState,
     db:    AsyncSession,
 ) -> OrchestratorState:
-    """Generate literature review from all paper analyses."""
+    """
+    Generate literature review.
+    LiteratureReviewAgent is SELF-THROTTLING (nodes call sync_wait + notify).
+    DO NOT call notify_groq_complete() here.
+    """
     logger.info("[ORCHESTRATOR] literature review")
     try:
         analyses   = await get_paper_analyses(db, state["chat_id"])
@@ -443,11 +465,10 @@ class OrchestratorAgent:
         """
         Full analysis pipeline:
           0. Detect task type
-          3-9. Per-paper agents (parallel)
-          11. Cross-paper comparison
+          3-9. Per-paper agents (parallel across papers)
+          10. Cross-paper comparison
+          11. Cross-paper gap detection (multi-paper only)
           12. Literature review
-
-        Returns: {results, comparison, lit_review, errors}
         """
         logger.info(
             f"[ORCHESTRATOR] full analysis "

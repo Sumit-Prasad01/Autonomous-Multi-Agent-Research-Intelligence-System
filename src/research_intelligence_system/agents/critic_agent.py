@@ -4,6 +4,15 @@ Evaluates the comprehensive summary from two-stage summarizer.
 Loops back to refine if quality score < 7.0 (max 2 retries).
 Step 4: Hallucination feedback loop — if hallucination_score > 0.3,
         feeds hallucinated sentences back into refine node for targeted correction.
+
+── THROTTLING ────────────────────────────────────────────────────────────────
+Each LangGraph node calls sync_wait_for_groq() BEFORE llm.invoke() and
+notify_groq_complete() AFTER. This registers every LLM call (up to 4-5 per
+critic pipeline) individually in the token bucket — preventing the ~3000 token
+under-count that caused cascade 429s on all subsequent stages.
+
+The public evaluate() method does NOT call wait_for_groq — the nodes handle it.
+─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
@@ -14,7 +23,10 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
 
-from src.research_intelligence_system.core.groq_limiter import wait_for_groq
+from src.research_intelligence_system.core.groq_limiter import (
+    sync_wait_for_groq,
+    notify_groq_complete,
+)
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -22,27 +34,26 @@ logger = get_logger(__name__)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 class CriticState(TypedDict):
-    paper_id:              str
-    llm_id:                str
-    summaries:             Dict[str, str]
-    entities:              Dict[str, Any]
-    chunks:                List[str]          # source chunks for hallucination check
-    refined_summary:       str
-    quality_score:         float
-    missing_entities:      List[str]
-    inconsistencies:       List[str]
-    hallucination_score:   float
+    paper_id:               str
+    llm_id:                 str
+    summaries:              Dict[str, str]
+    entities:               Dict[str, Any]
+    chunks:                 List[str]
+    refined_summary:        str
+    quality_score:          float
+    missing_entities:       List[str]
+    inconsistencies:        List[str]
+    hallucination_score:    float
     hallucinated_sentences: List[str]
-    critic_attempts:       int
-    hallucination_checked: bool               # prevent infinite hallucination loops
-    error:                 str
-    _feedback:             str
+    critic_attempts:        int
+    hallucination_checked:  bool
+    error:                  str
+    _feedback:              str
 
 
 _QUALITY_THRESHOLD       = 7.0
-_HALLUCINATION_THRESHOLD = 0.3   # trigger re-refinement if > 30% sentences unsupported
+_HALLUCINATION_THRESHOLD = 0.3
 _MAX_ATTEMPTS            = 2
-_MAX_HALL_REFINEMENTS    = 1     # max extra refinements triggered by hallucination
 
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
@@ -139,7 +150,7 @@ Rewrite the complete summary (400-500 words) ensuring:
 Return ONLY the rewritten summary text, no explanation, no headers."""
 
 
-# ── Hallucination check (sync, runs in critic pipeline) ───────────────────────
+# ── Hallucination check (sync, runs inside critic pipeline) ──────────────────
 def _check_hallucination_sync(
     summary: str,
     chunks:  List[str],
@@ -149,25 +160,14 @@ def _check_hallucination_sync(
         return {"hallucination_score": 0.0, "hallucinated_sentences": []}
 
     try:
-        from sentence_transformers import CrossEncoder
-        import re as _re
-
-        # reuse singleton from hallucination_detector if available
-        try:
-            from src.research_intelligence_system.agents.hallucination_detector import _get_model
-            model = _get_model()
-        except Exception:
-            model = CrossEncoder(
-                "BAAI/bge-reranker-base",
-                local_files_only=True,
-                device="cuda",
-            )
+        # always use singleton from hallucination_detector — never create new CrossEncoder
+        from src.research_intelligence_system.agents.hallucination_detector import get_cross_encoder
+        model = get_cross_encoder()
 
         if model is None:
             return {"hallucination_score": 0.0, "hallucinated_sentences": []}
 
-        # split into sentences
-        sentences = _re.split(r'(?<=[.!?])\s+', summary.strip())
+        sentences = re.split(r'(?<=[.!?])\s+', summary.strip())
         sentences = [s.strip() for s in sentences if len(s.strip()) >= 20][:15]
 
         hallucinated = []
@@ -212,10 +212,14 @@ def _critic_node(state: CriticState) -> CriticState:
         methods  = ", ".join(entities.get("methods",  [])[:10]),
     )
 
+    # ── throttle before LLM call ──────────────────────────────────────────────
+    sync_wait_for_groq(state["llm_id"], "critic")
     try:
         llm      = _get_llm(state["llm_id"])
         response = llm.invoke(prompt)
-        raw      = response.content.strip()
+        notify_groq_complete()   # ← update _last_call to NOW
+
+        raw = response.content.strip()
 
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not json_match:
@@ -253,6 +257,7 @@ def _critic_node(state: CriticState) -> CriticState:
         }
 
     except Exception as e:
+        notify_groq_complete()   # always notify even on failure
         logger.warning(f"[CRITIC] evaluation failed: {e}")
         return {
             **state,
@@ -278,11 +283,14 @@ def _refine_node(state: CriticState) -> CriticState:
         missing_entities = ", ".join(state.get("missing_entities", [])[:15]),
     )
 
+    # ── throttle before LLM call ──────────────────────────────────────────────
+    sync_wait_for_groq(state["llm_id"], "critic_refine")
     try:
         llm      = _get_llm(state["llm_id"])
         response = llm.invoke(prompt)
-        refined  = response.content.strip()
+        notify_groq_complete()   # ← update _last_call to NOW
 
+        refined = response.content.strip()
         logger.info(f"[CRITIC] refined summary generated ({len(refined)} chars)")
         return {
             **state,
@@ -292,6 +300,7 @@ def _refine_node(state: CriticState) -> CriticState:
         }
 
     except Exception as e:
+        notify_groq_complete()   # always notify even on failure
         logger.warning(f"[CRITIC] refinement failed: {e}")
         return {
             **state,
@@ -303,11 +312,10 @@ def _refine_node(state: CriticState) -> CriticState:
 def _hallucination_check_node(state: CriticState) -> CriticState:
     """
     Step 4: Hallucination feedback loop.
-    Check refined summary against source chunks.
-    If hallucination_score > threshold, flag for targeted re-refinement.
+    Uses singleton cross-encoder — no LLM call here, no throttling needed.
     """
     if state.get("hallucination_checked"):
-        return state   # already checked once — prevent infinite loop
+        return state
 
     summary = state.get("refined_summary") or _get_summary_to_evaluate(state["summaries"])
     chunks  = state.get("chunks", [])
@@ -333,34 +341,29 @@ def _hallucination_check_node(state: CriticState) -> CriticState:
 
 
 def _hallucination_refine_node(state: CriticState) -> CriticState:
-    """
-    Targeted refinement for hallucinated sentences.
-    Rewrites only the unsupported claims using source context.
-    """
+    """Targeted refinement for hallucinated sentences."""
     logger.info(f"[CRITIC] hallucination refinement paper_id={state['paper_id']}")
 
     current_summary    = state.get("refined_summary") or _get_summary_to_evaluate(state["summaries"])
     hallucinated_sents = state.get("hallucinated_sentences", [])
     chunks             = state.get("chunks", [])
-
-    # build source context from most relevant chunks
-    source_context = " ".join(chunks[:5])[:2000]
+    source_context     = " ".join(chunks[:5])[:2000]
 
     prompt = _HALLUCINATION_REFINE_PROMPT.format(
-        summary               = current_summary[:3000],
+        summary                = current_summary[:3000],
         hallucinated_sentences = "\n".join([f"- {s}" for s in hallucinated_sents]),
-        source_context        = source_context,
+        source_context         = source_context,
     )
 
+    # ── throttle before LLM call ──────────────────────────────────────────────
+    sync_wait_for_groq(state["llm_id"], "critic_refine")
     try:
         llm      = _get_llm(state["llm_id"])
         response = llm.invoke(prompt)
-        refined  = response.content.strip()
+        notify_groq_complete()   # ← update _last_call to NOW
 
-        logger.info(
-            f"[CRITIC] hallucination-refined summary "
-            f"({len(refined)} chars)"
-        )
+        refined = response.content.strip()
+        logger.info(f"[CRITIC] hallucination-refined summary ({len(refined)} chars)")
         return {
             **state,
             "refined_summary": refined,
@@ -368,6 +371,7 @@ def _hallucination_refine_node(state: CriticState) -> CriticState:
         }
 
     except Exception as e:
+        notify_groq_complete()   # always notify even on failure
         logger.warning(f"[CRITIC] hallucination refinement failed: {e}")
         return {**state, "error": str(e)}
 
@@ -406,7 +410,6 @@ def _after_refine(state: CriticState) -> str:
 
 
 def _should_hallucination_refine(state: CriticState) -> str:
-    """After hallucination check — decide whether to refine or accept."""
     hall_score = state.get("hallucination_score", 0.0)
     hall_sents = state.get("hallucinated_sentences", [])
 
@@ -433,13 +436,13 @@ def _build_graph() -> Any:
     graph.set_entry_point("critic")
 
     graph.add_conditional_edges("critic", _should_refine, {
-        "refine":             "refine",
-        "hallucination_check":"hallucination_check",
-        "accept":             "accept",
+        "refine":              "refine",
+        "hallucination_check": "hallucination_check",
+        "accept":              "accept",
     })
     graph.add_conditional_edges("refine", _after_refine, {
-        "critic":             "critic",
-        "hallucination_check":"hallucination_check",
+        "critic":              "critic",
+        "hallucination_check": "hallucination_check",
     })
     graph.add_conditional_edges("hallucination_check", _should_hallucination_refine, {
         "hallucination_refine": "hallucination_refine",
@@ -469,22 +472,14 @@ class CriticAgent:
     ) -> Dict[str, Any]:
         """
         Evaluate and refine the comprehensive summary.
-        Pipeline:
-          1. Critic scores quality (0-10)
-          2. If score < 7.0 → refine (max 2 times)
-          3. Hallucination check — score each sentence vs source chunks
-          4. If hallucination_score > 0.3 → targeted hallucination refinement
-          5. Accept final summary
 
-        Args:
-            paper_id:  Paper UUID
-            summaries: Dict with 'comprehensive' key from two-stage summarizer
-            entities:  Extracted entities for critic evaluation
-            chunks:    Source paper text chunks for hallucination checking
+        NOTE: wait_for_groq is NOT called here. Each LangGraph node calls
+        sync_wait_for_groq() and notify_groq_complete() individually, so every
+        LLM call (up to 4-5 per critic run) is correctly registered in the
+        token bucket. The orchestrator must NOT call notify_groq_complete()
+        after this method — the nodes handle all throttling internally.
         """
         import asyncio
-
-        await wait_for_groq(self.llm_id, "critic")
 
         loop = asyncio.get_running_loop()
 

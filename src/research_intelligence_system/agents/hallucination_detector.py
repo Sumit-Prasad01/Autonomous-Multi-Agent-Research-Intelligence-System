@@ -25,11 +25,11 @@ logger = get_logger(__name__)
 _POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hallucination")
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
-_SUPPORT_THRESHOLD     = 0.0   # cross-encoder score above this = supported
-_TRIPLE_THRESHOLD      = -2.0  # lower threshold — triples are short, harder to match
-_MIN_SENTENCE_LEN      = 20
-_MAX_SENTENCES         = 15
-_MAX_CHUNKS            = 10
+_SUPPORT_THRESHOLD = 0.0    # cross-encoder score above this = supported
+_TRIPLE_THRESHOLD  = -2.0   # lower threshold — triples are short, harder to match
+_MIN_SENTENCE_LEN  = 20
+_MAX_SENTENCES     = 15
+_MAX_CHUNKS        = 10
 
 
 # ── Singleton cross-encoder ───────────────────────────────────────────────────
@@ -38,23 +38,52 @@ _model_lock = threading.Lock()
 
 
 def _get_model():
-    """Load cross-encoder once and reuse — avoids repeated CUDA allocation."""
+    """
+    Load BGE cross-encoder once per process and reuse forever.
+
+    The double-check locking pattern ensures thread safety:
+    only one thread can create the model even under concurrent access.
+
+    local_files_only is intentionally NOT set — sentence_transformers will
+    use its disk cache (typically ~/.cache/huggingface/) on subsequent runs.
+    The first run downloads the model (~500MB); all subsequent runs load
+    from disk instantly. The HuggingFace API metadata ping happens only
+    during the first CrossEncoder() construction call per process.
+    """
     global _model
     if _model is None:
         with _model_lock:
-            if _model is None:
+            if _model is None:   # second check under lock
                 try:
+                    import torch
                     from sentence_transformers import CrossEncoder
-                    _model = CrossEncoder(
-                        "BAAI/bge-reranker-base",
-                        local_files_only=True,
-                        device="cuda",
-                    )
-                    logger.info("[HALLUCINATION] cross-encoder loaded on CUDA")
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    _model = CrossEncoder("BAAI/bge-reranker-base", device=device)
+                    logger.info(f"[HALLUCINATION] cross-encoder loaded on {device}")
                 except Exception as e:
                     logger.warning(f"[HALLUCINATION] cross-encoder load failed: {e}")
                     _model = None
     return _model
+
+
+# ── Pre-warm: load model at module import time ────────────────────────────────
+# This ensures the model is ready before the first paper analysis request,
+# eliminating the 4s cold-load penalty that previously occurred mid-pipeline.
+# The import of this module happens at server startup, so the 4s cost is
+# paid once at boot — not once per paper.
+def _prewarm() -> None:
+    """Trigger model load in a background thread at import time."""
+    def _load():
+        _get_model()
+
+    t = threading.Thread(target=_load, daemon=True, name="cross-encoder-prewarm")
+    t.start()
+
+_prewarm()
+
+
+# Public alias for critic_agent and other callers
+get_cross_encoder = _get_model
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -104,10 +133,10 @@ def _empty_result() -> Dict:
 
 def _empty_triple_result() -> Dict:
     return {
-        "filtered_triples":     [],
-        "removed_count":        0,
-        "kept_count":           0,
-        "faithfulness_rate":    1.0,
+        "filtered_triples":  [],
+        "removed_count":     0,
+        "kept_count":        0,
+        "faithfulness_rate": 1.0,
     }
 
 
@@ -179,11 +208,7 @@ def _filter_triples_sync(
     triples: List[Dict],
     chunks:  List[str],
 ) -> Dict:
-    """
-    Filter knowledge graph triples by faithfulness score.
-    Removes triples not supported by source text.
-    Prevents hallucinated edges from corrupting the knowledge graph.
-    """
+    """Filter knowledge graph triples by faithfulness score."""
     model = _get_model()
     if model is None or not triples or not chunks:
         return {
@@ -197,7 +222,6 @@ def _filter_triples_sync(
     removed = []
 
     for triple in triples:
-        # build natural language claim from triple
         subject  = triple.get("subject",  "")
         relation = triple.get("relation", "").replace("_", " ").lower()
         obj      = triple.get("object",   "")
@@ -208,17 +232,13 @@ def _filter_triples_sync(
         )
 
         if score > _TRIPLE_THRESHOLD:
-            # boost confidence for well-grounded triples
             triple["faithfulness_score"] = round(float(score), 4)
             kept.append(triple)
         else:
             removed.append(triple)
-            logger.debug(
-                f"[TRIPLE FILTER] removed '{claim}' "
-                f"score={score:.3f}"
-            )
+            logger.debug(f"[TRIPLE FILTER] removed '{claim}' score={score:.3f}")
 
-    total            = len(triples)
+    total             = len(triples)
     faithfulness_rate = len(kept) / total if total > 0 else 1.0
 
     logger.info(
@@ -240,27 +260,20 @@ def _score_gaps_sync(
     gaps:   List[Dict],
     chunks: List[str],
 ) -> Dict:
-    """
-    Score gap supporting_evidence against source chunks.
-    Flags gaps where evidence is not grounded in source text.
-    Does NOT remove gaps — only adds confidence score.
-    """
+    """Score gap supporting_evidence against source chunks."""
     model = _get_model()
     if model is None or not gaps or not chunks:
-        return {
-            "scored_gaps":          gaps,
-            "low_confidence_count": 0,
-        }
+        return {"scored_gaps": gaps, "low_confidence_count": 0}
 
-    scored_gaps        = []
-    low_confidence     = 0
+    scored_gaps    = []
+    low_confidence = 0
 
     for gap in gaps:
         evidence = gap.get("supporting_evidence", "")
 
         if not evidence or len(evidence) < 20:
-            gap["evidence_score"]      = 0.5  # neutral when no evidence
-            gap["evidence_grounded"]   = True
+            gap["evidence_score"]    = 0.5
+            gap["evidence_grounded"] = True
             scored_gaps.append(gap)
             continue
 
@@ -292,13 +305,9 @@ async def compute_hallucination_score(
     summary: str,
     chunks:  List[str],
 ) -> Dict:
-    """
-    Async — compute sentence-level hallucination score for a summary.
-    Returns hallucination_score, faithfulness_score, hallucinated_sentences.
-    """
+    """Async — sentence-level hallucination score for a summary."""
     if not summary or not chunks:
         return _empty_result()
-
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         _POOL, _compute_hallucination_sync, summary, chunks,
@@ -309,11 +318,7 @@ async def filter_triples_by_faithfulness(
     triples: List[Dict],
     chunks:  List[str],
 ) -> Dict:
-    """
-    Async — filter knowledge graph triples by source faithfulness.
-    Removes triples not supported by paper text.
-    Returns filtered_triples, removed_count, kept_count, faithfulness_rate.
-    """
+    """Async — filter knowledge graph triples by source faithfulness."""
     if not triples or not chunks:
         return {
             "filtered_triples":  triples,
@@ -321,7 +326,6 @@ async def filter_triples_by_faithfulness(
             "kept_count":        len(triples),
             "faithfulness_rate": 1.0,
         }
-
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         _POOL, _filter_triples_sync, triples, chunks,
@@ -332,14 +336,9 @@ async def score_gap_evidence(
     gaps:   List[Dict],
     chunks: List[str],
 ) -> Dict:
-    """
-    Async — score gap supporting_evidence against source chunks.
-    Adds evidence_score and evidence_grounded fields to each gap.
-    Returns scored_gaps, low_confidence_count.
-    """
+    """Async — score gap supporting_evidence against source chunks."""
     if not gaps or not chunks:
         return {"scored_gaps": gaps, "low_confidence_count": 0}
-
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         _POOL, _score_gaps_sync, gaps, chunks,

@@ -1,23 +1,40 @@
 """
 groq_limiter.py — Centralized Groq API rate limit manager
 
-── WHY notify_complete() EXISTS ─────────────────────────────────────────────
-The inter-stage gap must be measured from when the LAST LLM CALL COMPLETED,
-not from when we started waiting. Without this, the sequence is:
+── HOW THIS WORKS ───────────────────────────────────────────────────────────
+Two-layer protection against Groq 429s:
 
-  T=0:   orchestrator calls wait_for_groq("comparison") → _last_call = T=0
-  T=0-5: comparison LLM runs (inside executor, takes 5s)
-  T=5:   executor returns
-  T=5.03: lit_review _sync_wait fires → gap_wait = 2.5 - (5.03 - 0) = 0 → NO SLEEP → 429
+Layer 1 — Token bucket (60s rolling window):
+  Every llm.invoke() call must call sync_wait_for_groq() BEFORE invoking.
+  This reserves tokens and waits if the 60s budget is exhausted.
 
-With notify_complete() called at T=5:
-  T=5:   executor returns → orchestrator calls notify_complete() → _last_call = T=5
-  T=5.03: lit_review _sync_wait fires → gap_wait = 2.5 - (5.03 - 5) = 2.47s → SLEEP ✅
+Layer 2 — Inter-stage gap (4s minimum between call COMPLETIONS):
+  Every llm.invoke() call must call notify_groq_complete() AFTER it returns.
+  This updates _last_call to the actual completion time so the next call
+  measures the gap from when the LLM finished, not when we started waiting.
 
-Call pattern:
-  await wait_for_groq(model, stage)          # before dispatch
-  result = await loop.run_in_executor(...)   # agent runs LLM inside
-  notify_groq_complete()                     # after executor returns ← required
+── TOKEN ESTIMATE CALIBRATION ───────────────────────────────────────────────
+STAGE_TOKENS values are reserved before each LLM call. Over-estimating fills
+the bucket faster and causes longer token_wait delays.
+
+Calibration basis (observed on gpt-oss-120b):
+  triples: 5000-char input (~1200 input tokens) + 12–20 triples output (~400 tokens)
+           = ~1600 actual. Reserve 1800 (12% buffer). Was 2500 (56% over).
+  The 700-token reduction saves ~8s off the token_wait at lit_review stage.
+
+── CALL PATTERN ─────────────────────────────────────────────────────────────
+Inside LangGraph nodes (sync executor thread):
+    sync_wait_for_groq(state["llm_id"], "stage_name")
+    try:
+        response = llm.invoke(prompt)
+        notify_groq_complete()
+    except Exception as e:
+        notify_groq_complete()   # always notify, even on failure
+        raise
+
+In orchestrator (for agents throttling via public method):
+    result = await SomeAgent().method(...)
+    notify_groq_complete()       # after await returns
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -42,13 +59,13 @@ _MODEL_TPM: Dict[str, int] = {
 }
 _DEFAULT_TPM = 5100
 
-# ── Token estimates per stage ─────────────────────────────────────────────────
+# ── Token estimates per stage (calibrated from observed usage) ────────────────
 STAGE_TOKENS: Dict[str, int] = {
     "extraction":          1200,
     "summarization":        900,
     "critic":              1100,
     "critic_refine":        900,
-    "triples":             2500,
+    "triples":             1800,   # was 2500; actual ~1600, reserve 1800 (12% buffer)
     "gap_detection":       1900,
     "comparison":          1500,
     "lit_review_themes":    800,
@@ -56,8 +73,7 @@ STAGE_TOKENS: Dict[str, int] = {
     "qa":                  1000,
 }
 
-# ── Minimum gap between consecutive LLM call COMPLETIONS (not starts) ─────────
-_MIN_INTER_STAGE_GAP: float = 2.5
+_MIN_INTER_STAGE_GAP: float = 4.0
 
 
 class GroqRateLimiter:
@@ -66,7 +82,7 @@ class GroqRateLimiter:
         self._lock       = threading.Lock()
         self._usage:     Dict[str, list] = {}
         self._window     = 60.0
-        self._last_call: float = 0.0   # set AFTER each LLM call completes
+        self._last_call: float = 0.0
 
     def _clean_window(self, model: str) -> None:
         cutoff = time.monotonic() - self._window
@@ -82,14 +98,13 @@ class GroqRateLimiter:
         return _MODEL_TPM.get(model, _DEFAULT_TPM)
 
     def reserve(self, model: str, tokens: int) -> None:
-        """Reserve tokens before an LLM call."""
         with self._lock:
             entries = self._usage.setdefault(model, [])
             entries.append((time.monotonic(), tokens))
             entries.sort(key=lambda x: x[0])
 
     def notify_complete(self) -> None:
-        """Update _last_call to NOW. Call immediately after llm.invoke() returns."""
+        """Set _last_call = NOW. Call immediately after llm.invoke() returns."""
         with self._lock:
             self._last_call = time.monotonic()
 
@@ -108,8 +123,12 @@ class GroqRateLimiter:
             gap_wait = max(0.0, _MIN_INTER_STAGE_GAP - (now - self._last_call))
             return max(token_wait, gap_wait)
 
-    async def wait_for_budget(self, model: str, stage: str,
-                               estimated_tokens: Optional[int] = None) -> None:
+    async def wait_for_budget(
+        self,
+        model:            str,
+        stage:            str,
+        estimated_tokens: Optional[int] = None,
+    ) -> None:
         tokens = estimated_tokens or STAGE_TOKENS.get(stage, 2000)
         wait   = self.wait_needed(model, tokens)
         if wait > 0:
@@ -126,29 +145,18 @@ def get_limiter() -> GroqRateLimiter:
     return _limiter
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 async def wait_for_groq(model: str, stage: str) -> None:
-    """Call BEFORE dispatching to executor. Pair with notify_groq_complete() after."""
+    """Async: call BEFORE llm.invoke(). Pair with notify_groq_complete() after."""
     await _limiter.wait_for_budget(model, stage)
 
 
 def notify_groq_complete() -> None:
-    """
-    Call AFTER run_in_executor (or llm.invoke) returns.
-    This is what makes gap enforcement work correctly.
-
-    Without this, _last_call is set at the START of the wait (before the LLM runs),
-    so by the time the next stage fires, the gap appears to have already elapsed.
-    """
+    """Call AFTER llm.invoke() — in both success AND exception paths."""
     _limiter.notify_complete()
 
 
 def sync_wait_for_groq(model: str, stage: str) -> None:
-    """
-    For use inside LangGraph nodes (sync executor threads).
-    Call BEFORE llm.invoke(). Pair with notify_groq_complete() after.
-    """
+    """Sync version for LangGraph nodes in executor threads."""
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(wait_for_groq(model, stage))

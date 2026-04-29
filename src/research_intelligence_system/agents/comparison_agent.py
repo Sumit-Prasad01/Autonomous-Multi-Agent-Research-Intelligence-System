@@ -2,6 +2,25 @@
 comparison_agent.py — LangGraph-based comparison agent
 1 paper  → web-augmented comparison (arXiv + Tavily)
 2+ papers → direct paper vs paper comparison
+
+── QUALITY DESIGN ────────────────────────────────────────────────────────────
+Three problems caused poor comparison table quality:
+
+1. Uploaded paper row showed Score=N/A, Year=N/A:
+   The prompt only received summary[:1000] and entity lists. If the summary
+   didn't explicitly say "41.0 BLEU" and the year wasn't in those fields,
+   the LLM had no data to fill those cells and correctly wrote N/A.
+   Fix: explicitly pass year, key_results, and a longer summary (1500 chars).
+   key_results is built from the refined_summary by extracting numeric patterns.
+
+2. Retrieved papers were irrelevant (5 dropout papers for a Transformer paper):
+   Caused by arXiv query containing "dropout" — fixed in arxiv_service.py.
+   But as a second layer of defence, the prompt now instructs the LLM to skip
+   rows for papers that are clearly from a different research area.
+
+3. Tavily query had duplicate terms ("BERT BERT Transformer"):
+   Already fixed — title_words deduplication is preserved here.
+─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
@@ -12,6 +31,10 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langchain_groq import ChatGroq
 from langgraph.graph import END, StateGraph
 
+from src.research_intelligence_system.core.groq_limiter import (
+    sync_wait_for_groq,
+    notify_groq_complete,
+)
 from src.research_intelligence_system.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -25,7 +48,7 @@ class ComparisonState(TypedDict):
     use_web:          bool
     web_papers:       List[Dict]
     comparison_table: Dict[str, Any]
-    ranking:          List[str]
+    ranking:          str
     evolution_trends: str
     positioning:      str
     web_papers_used:  List[Dict]
@@ -38,33 +61,72 @@ def _get_llm(llm_id: str) -> ChatGroq:
     return ChatGroq(model=llm_id, temperature=0.2)
 
 
-# ── Title cleaner ─────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _clean_title(filename: str) -> str:
-    """Remove MD5 hash prefix and clean filename into readable title."""
     name = filename or "Uploaded Paper"
-    # remove 32-char hex hash prefix + underscore
     name = re.sub(r'^[a-f0-9]{32}_', '', name)
-    # remove .pdf extension
     name = re.sub(r'\.pdf$', '', name, flags=re.IGNORECASE)
-    # replace underscores with spaces
     name = name.replace("_", " ").strip()
     return name or "Uploaded Paper"
 
 
+def _extract_key_results(summary: str, metrics: List[str], datasets: List[str]) -> str:
+    """
+    Pull numeric result sentences from the summary to give the LLM explicit
+    score data for filling the Score column.
+
+    Strategy: find sentences that contain both a number and a metric/dataset name.
+    Returns a concise string like "41.0 BLEU on WMT 2014 EN-FR; 28.4 BLEU on EN-DE"
+    """
+    if not summary:
+        return ""
+
+    # Build a set of known metric/dataset keywords for matching
+    known_terms = set()
+    for m in metrics[:5]:
+        known_terms.update(m.lower().split())
+    for d in datasets[:5]:
+        known_terms.update(d.lower().split())
+    # remove stopwords from the match set
+    _sw = {"on", "the", "a", "an", "of", "for", "in", "with", "and", "or", "to"}
+    known_terms -= _sw
+
+    # Split summary into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', summary.strip())
+
+    # A sentence is a "result sentence" if it has a number AND a known term
+    result_sentences = []
+    for sent in sentences:
+        has_number = bool(re.search(r'\b\d+\.?\d*\b', sent))
+        sent_lower = sent.lower()
+        has_metric = any(kw in sent_lower for kw in known_terms if len(kw) >= 3)
+        if has_number and has_metric and len(sent) < 300:
+            result_sentences.append(sent.strip())
+
+    if not result_sentences:
+        return ""
+
+    # Return up to 4 result sentences, joined with semicolons for compact display
+    return " | ".join(result_sentences[:4])
+
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
-_WEB_COMPARISON_PROMPT = """[SYSTEM] You are a scientific literature analyst. \
-Your task is to compare an uploaded research paper against related papers retrieved from the web. \
-You produce structured JSON only. Every claim in your output must be traceable to the provided text.
+_WEB_COMPARISON_PROMPT = """\
+[SYSTEM] You are a scientific literature analyst producing a structured comparison \
+of a research paper against related works. Output is JSON only. \
+Every cell value must be traceable to the provided text — do not invent or estimate.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 UPLOADED PAPER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Title   : {title}
-Summary : {summary}
-Models  : {models}
-Datasets: {datasets}
-Metrics : {metrics}
-Methods : {methods}
+Title      : {title}
+Year       : {year}
+Summary    : {summary}
+Key Results: {key_results}
+Models     : {models}
+Datasets   : {datasets}
+Metrics    : {metrics}
+Methods    : {methods}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RELATED PAPERS (retrieved from arXiv / web)
@@ -74,46 +136,44 @@ RELATED PAPERS (retrieved from arXiv / web)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ANALYSIS INSTRUCTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# In _WEB_COMPARISON_PROMPT, inside the comparison_table instruction block, add:
-
-PHANTOM ROW RULE: 
-  • Every row must correspond to a named research paper.
-    Do not create rows for datasets, benchmarks, or metric values that are
-    not themselves paper titles. If the uploaded paper reports a result
-    (e.g. "85.43% Top-1 on ImageNet"), that value belongs in the uploaded
-    paper's row — not in a separate row named after the dataset.
 comparison_table:
-  • One row per paper (uploaded paper first, then related papers).
-  • Model: use the primary model/algorithm name. Use "N/A" if not stated.
-  • Dataset: use the primary evaluation dataset. Use "N/A" if not stated.
-  • Key Metric: use the metric name that best characterises the paper's main result.
-  • Score: copy the EXACT value from the source text. Use "N/A" if not explicitly stated — do NOT invent or estimate.
-  • Year: use publication year. Use "N/A" if unknown.
-  • PHANTOM ROW RULE: every row must correspond to a named research paper.
-    Do not create rows for datasets, benchmarks, or metric values that are
-    not themselves paper titles. Results from the uploaded paper belong in
-    the uploaded paper's row only — never in a separate row.
-  • HALLUCINATION RULE: every cell value must appear verbatim in the provided text above.
-    If you cannot find it, write "N/A".
+  • One row per paper: uploaded paper FIRST, then only RELEVANT related papers.
+  • RELEVANCE FILTER: skip any retrieved paper that is clearly from a different
+    research area than the uploaded paper. For example, if the uploaded paper is
+    about Transformer architecture for machine translation, skip papers that are
+    purely about dropout regularization, image segmentation, or reinforcement
+    learning — they are not meaningful comparisons.
+  • Paper column: exact paper title.
+  • Model: primary model or algorithm name. "N/A" if not stated in the provided text.
+  • Dataset: primary evaluation dataset. "N/A" if not stated.
+  • Key Metric: metric name that best characterises the paper's main result.
+  • Score: EXACT numeric value from the provided text.
+    For the uploaded paper: look in Key Results above first, then the Summary.
+    For retrieved papers: look in their abstracts below.
+    Use "N/A" ONLY if no numeric score appears anywhere in the provided text.
+    Do NOT estimate, round, or invent values.
+  • Year: for the uploaded paper use Year={year}. For retrieved papers use
+    their publication year. "N/A" only if genuinely unknown.
+  • PHANTOM ROW RULE: only create rows for named research papers. No rows
+    for datasets, metrics, or benchmark names.
 
 ranking:
-  • Order papers from strongest to weakest contribution.
-  • If the primary metric is the same across papers, rank by that metric score descending.
-  • If metrics differ, rank by recency (newest first).
-  • If only one paper has a score, it ranks first; others follow by year.
-  • State your ranking criterion in a brief prefix, e.g. "Ranked by Top-1 Accuracy on ImageNet:"
+  • Include only papers that appear in the comparison_table.
+  • If papers share the same metric → rank by score descending.
+  • If metrics differ → rank by recency (newest first).
+  • Prefix: "Ranked by <criterion>: 1. Paper, 2. Paper, ..."
 
 evolution_trends:
-  • 2–3 sentences. Describe how the methods or results in these papers represent a progression
-    or shift in the research area. Ground claims in the paper titles/abstracts provided.
+  • 2–3 sentences on the methodological progression these papers represent.
+  • Cite specific paper titles and years.
 
 positioning:
-  • 2–3 sentences. Explain where the uploaded paper sits relative to the retrieved work:
-    ahead, behind, orthogonal, or complementary. Be specific about WHY.
+  • 2–3 sentences. Where does the uploaded paper sit relative to the relevant
+    retrieved works — ahead, behind, orthogonal, or complementary? WHY specifically?
 
 web_papers_used:
-  • List only papers that contributed at least one cell value in the comparison_table.
-  • Format: {{"title": "paper title", "url": "url or arxiv_id if available"}}
+  • Only papers that appear as rows in comparison_table.
+  • Format: {{"title": "paper title", "url": "url or N/A"}}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT — JSON ONLY
@@ -122,22 +182,24 @@ OUTPUT — JSON ONLY
   "comparison_table": {{
     "headers": ["Paper", "Model", "Dataset", "Key Metric", "Score", "Year"],
     "rows": [
-      ["{title}", "model_name", "dataset_name", "metric_name", "score_or_N/A", "year_or_N/A"],
-      ["Related Paper Title", "...", "...", "...", "...", "..."]
+      ["{title}", "primary_model", "primary_dataset", "primary_metric", "score_from_key_results", "{year}"],
+      ["Relevant Related Paper", "...", "...", "...", "...", "..."]
     ]
   }},
   "ranking": "Ranked by <criterion>: 1. Paper A, 2. Paper B, ...",
-  "evolution_trends": "2-3 sentence trend analysis grounded in the provided abstracts.",
-  "positioning": "2-3 sentence positioning of the uploaded paper relative to retrieved work.",
+  "evolution_trends": "2-3 sentence trend analysis citing specific papers.",
+  "positioning": "2-3 sentence positioning with specific technical reason.",
   "web_papers_used": [
     {{"title": "paper title", "url": "url or N/A"}}
   ]
-}}"""
+}}\
+"""
 
 
-_DIRECT_COMPARISON_PROMPT = """[SYSTEM] You are a scientific literature analyst. \
-Your task is to compare {n} uploaded research papers directly against each other. \
-You produce structured JSON only. Every claim must be traceable to the provided paper summaries below.
+_DIRECT_COMPARISON_PROMPT = """\
+[SYSTEM] You are a scientific literature analyst producing a direct comparison \
+of {n} research papers. Output is JSON only. \
+Every cell value must be traceable to the provided paper summaries.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PAPERS TO COMPARE
@@ -148,28 +210,27 @@ PAPERS TO COMPARE
 ANALYSIS INSTRUCTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 comparison_table:
-  • One row per paper, in the order provided above.
-  • Model: primary model or algorithm name. "N/A" if absent.
+  • One row per paper, in the order provided.
+  • Model: primary model or algorithm name. "N/A" if absent from the summary.
   • Dataset: primary evaluation dataset. "N/A" if absent.
-  • Key Metric: the metric that best characterises each paper's main claim.
-    If papers use different metrics, choose the most comparable one; note discrepancy in positioning.
-  • Score: EXACT value from the provided summary text. "N/A" if not explicitly stated. Do NOT estimate.
-  • Key Innovation: one clause naming what is technically new (e.g. "dynamic sparse attention",
-    "graph-based gap detection", "cross-encoder reranking"). Not the topic — the mechanism.
-  • HALLUCINATION RULE: if a value is not in the provided text, write "N/A".
+  • Key Metric: metric that best characterises the paper's main claim.
+  • Score: EXACT numeric value from the summary. "N/A" only if not present.
+  • Key Innovation: one clause describing the specific technical mechanism
+    (e.g. "scaled dot-product self-attention without recurrence").
+    Not the topic — the mechanism. "N/A" if not determinable.
+  • HALLUCINATION RULE: if a value is not in the provided summaries, write "N/A".
 
 ranking:
-  • If all papers share the same primary metric → rank by that score descending.
-  • If metrics differ → rank by recency (newest first), note "metrics incomparable".
-  • Format: "Ranked by <criterion>: 1. <Paper Title>, 2. <Paper Title>, ..."
+  • Same primary metric across papers → rank by score descending.
+  • Different metrics → rank by recency, note "metrics incomparable".
+  • Format: "Ranked by <criterion>: 1. Paper, 2. Paper, ..."
 
 evolution_trends:
-  • 2–3 sentences. Identify the methodological direction these papers collectively represent.
-    Is the field moving toward efficiency? Scale? Interpretability? Ground this in the summaries.
+  • 2–3 sentences on the methodological direction these papers collectively represent.
 
 positioning:
-  • 2–3 sentences. Identify which paper makes the most novel or impactful contribution and explain
-    the specific technical reason. If papers are in different sub-areas, say so explicitly.
+  • 2–3 sentences. Which paper makes the most novel or impactful contribution?
+    Give a specific technical reason, not a general statement.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT — JSON ONLY
@@ -178,14 +239,15 @@ OUTPUT — JSON ONLY
   "comparison_table": {{
     "headers": ["Paper", "Model", "Dataset", "Key Metric", "Score", "Key Innovation"],
     "rows": [
-      ["Paper 1 Title", "model", "dataset", "metric", "score_or_N/A", "one-clause innovation"],
+      ["Paper 1 Title", "model", "dataset", "metric", "score_or_N/A", "one-clause mechanism"],
       ["Paper 2 Title", "...", "...", "...", "...", "..."]
     ]
   }},
   "ranking": "Ranked by <criterion>: 1. Paper Title, 2. Paper Title, ...",
   "evolution_trends": "2-3 sentence methodological trend analysis.",
-  "positioning": "2-3 sentence assessment of the most significant contribution and why."
-}}"""
+  "positioning": "2-3 sentence assessment with specific technical reason."
+}}\
+"""
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
@@ -204,7 +266,7 @@ def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
 
     web_papers = []
 
-    # ── arXiv via search_by_entities (consistent query building) ──────────
+    # ── arXiv via search_by_entities ─────────────────────────────────────────
     try:
         import asyncio
         from src.research_intelligence_system.tools.arxiv_service import ArxivService
@@ -212,11 +274,11 @@ def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
         loop = asyncio.new_event_loop()
         arxiv_papers = loop.run_until_complete(
             ArxivService().search_by_entities(
-                models   = entities.get("models",   []),
-                datasets = entities.get("datasets", []),
-                methods  = entities.get("methods",  []),
-                tasks    = entities.get("tasks",    []),
-                title    = title,
+                models      = entities.get("models",   []),
+                datasets    = entities.get("datasets", []),
+                methods     = entities.get("methods",  []),
+                tasks       = entities.get("tasks",    []),
+                title       = title,
                 max_results = 5,
             )
         )
@@ -226,20 +288,27 @@ def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
     except Exception as e:
         logger.warning(f"[COMPARISON] arXiv failed: {e}")
 
-    # ── Tavily web search ──────────────────────────────────────────────────
+    # ── Tavily web search ─────────────────────────────────────────────────────
     try:
         from src.research_intelligence_system.tools.web_search import sync_web_search
-        # use clean title + top 2 models only
-        models_str   = " ".join(entities.get("models", [])[:2])
+
+        # Deduplicate: skip model names already in the title
+        title_words   = set(title.lower().split())
+        unique_models = [
+            m for m in entities.get("models", [])[:2]
+            if m.lower() not in title_words and m.lower() not in title.lower()
+        ]
+        models_str   = " ".join(unique_models[:2])
         tavily_query = f"research papers similar to {title} {models_str}".strip()
-        web_text     = sync_web_search(tavily_query)
+
+        web_text = sync_web_search(tavily_query)
         if web_text:
             web_papers.append({
                 "title":    "Web Search Results",
                 "abstract": web_text[:800],
                 "source":   "tavily",
             })
-        logger.info(f"[WEB SEARCH] query={tavily_query!r:.60}")
+        logger.info(f"[WEB SEARCH] query={tavily_query!r:.80}")
     except Exception as e:
         logger.warning(f"[COMPARISON] Tavily failed: {e}")
 
@@ -255,72 +324,115 @@ def _compare_node(state: ComparisonState) -> ComparisonState:
         return {**state, "error": "no papers to compare",
                 "retry_count": state["retry_count"] + 1}
 
-    try:
-        llm = _get_llm(state["llm_id"])
+    if state["use_web"]:
+        paper    = analyses[0]
+        entities = paper.entities or {}
+        title    = _clean_title(paper.filename or "")
 
-        if state["use_web"]:
-            paper    = analyses[0]
+        # ── Extract year ──────────────────────────────────────────────────────
+        year = str(entities.get("year", "") or "").strip() or "N/A"
+
+        # ── Extract key numeric results from the refined summary ──────────────
+        refined_summary = paper.refined_summary or ""
+        key_results = _extract_key_results(
+            summary  = refined_summary,
+            metrics  = entities.get("metrics",  []),
+            datasets = entities.get("datasets", []),
+        )
+        if not key_results:
+            key_results = "See summary above — extract numeric scores from Key Metric + Dataset mentions."
+
+        # ── Build web papers text ─────────────────────────────────────────────
+        web_text = "\n".join([
+            f"- {p.get('title', 'Unknown')} ({p.get('year', 'N/A')}): {p.get('abstract', '')[:300]}"
+            for p in state.get("web_papers", [])
+        ]) or "No related papers retrieved."
+
+        prompt = _WEB_COMPARISON_PROMPT.format(
+            title       = title,
+            year        = year,
+            summary     = refined_summary[:1500],   # ↑ was 1000
+            key_results = key_results,
+            models      = ", ".join(entities.get("models",   [])[:8]),
+            datasets    = ", ".join(entities.get("datasets", [])[:8]),
+            metrics     = ", ".join(entities.get("metrics",  [])[:8]),
+            methods     = ", ".join(entities.get("methods",  [])[:8]),
+            web_papers  = web_text,
+        )
+
+    else:
+        papers_text = ""
+        for i, paper in enumerate(analyses, 1):
             entities = paper.entities or {}
-            title    = _clean_title(paper.filename or "")
+            title    = _clean_title(paper.filename or f"Paper {i}")
+            year     = str(entities.get("year", "") or "").strip() or "N/A"
 
-            web_text = "\n".join([
-                f"- {p.get('title', 'Unknown')} ({p.get('year', '')}): {p.get('abstract', '')[:300]}"
-                for p in state.get("web_papers", [])
-            ]) or "No related papers found online."
-
-            prompt = _WEB_COMPARISON_PROMPT.format(
-                title     = title,
-                summary   = (paper.refined_summary or "")[:1000],
-                models    = ", ".join(entities.get("models",   [])[:8]),
-                datasets  = ", ".join(entities.get("datasets", [])[:8]),
-                metrics   = ", ".join(entities.get("metrics",  [])[:8]),
-                methods   = ", ".join(entities.get("methods",  [])[:8]),
-                web_papers= web_text,
-            )
-        else:
-            papers_text = ""
-            for i, paper in enumerate(analyses, 1):
-                entities = paper.entities or {}
-                title    = _clean_title(paper.filename or f"Paper {i}")
-                papers_text += f"""
-Paper {i}: {title}
-Summary:  {(paper.refined_summary or '')[:500]}
-Models:   {', '.join(entities.get('models',   [])[:5])}
-Datasets: {', '.join(entities.get('datasets', [])[:5])}
-Metrics:  {', '.join(entities.get('metrics',  [])[:5])}
-Methods:  {', '.join(entities.get('methods',  [])[:5])}
----"""
-
-            prompt = _DIRECT_COMPARISON_PROMPT.format(
-                n      = len(analyses),
-                papers = papers_text,
+            key_results = _extract_key_results(
+                summary  = paper.refined_summary or "",
+                metrics  = entities.get("metrics",  []),
+                datasets = entities.get("datasets", []),
             )
 
+            papers_text += (
+                f"\nPaper {i}: {title} ({year})\n"
+                f"Summary:     {(paper.refined_summary or '')[:600]}\n"
+                f"Key Results: {key_results or 'not explicitly stated'}\n"
+                f"Models:      {', '.join(entities.get('models',   [])[:5])}\n"
+                f"Datasets:    {', '.join(entities.get('datasets', [])[:5])}\n"
+                f"Metrics:     {', '.join(entities.get('metrics',  [])[:5])}\n"
+                f"Methods:     {', '.join(entities.get('methods',  [])[:5])}\n---"
+            )
+
+        prompt = _DIRECT_COMPARISON_PROMPT.format(
+            n      = len(analyses),
+            papers = papers_text,
+        )
+
+    # ── throttle before LLM call ──────────────────────────────────────────────
+    sync_wait_for_groq(state["llm_id"], "comparison")
+    try:
+        llm      = _get_llm(state["llm_id"])
         response = llm.invoke(prompt)
-        raw      = response.content.strip()
+        notify_groq_complete()
 
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if not json_match:
-            raise ValueError("No JSON in comparison response")
+        raw = response.content.strip()
 
-        # clean control characters before parsing
-        cleaned = json_match.group()
-        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
-        result  = json.loads(cleaned)
+        # Strip markdown fences
+        raw = re.sub(r'```(?:json)?\s*', '', raw)
+        raw = re.sub(r'```\s*$', '', raw, flags=re.MULTILINE)
+        raw = raw.strip()
 
-        logger.info(f"[COMPARISON] done — {len(result.get('ranking', []))} papers ranked")
+        # Try direct parse first
+        result = None
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
+        if result is None:
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON in comparison response")
+            cleaned = json_match.group()
+            cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', cleaned)
+            result  = json.loads(cleaned)
+
+        ranking_str  = result.get("ranking", "")
+        papers_count = ranking_str.count(",") + 1 if ranking_str else 0
+        logger.info(f"[COMPARISON] done ✅ {papers_count} papers ranked")
 
         return {
             **state,
             "comparison_table": result.get("comparison_table", {}),
-            "ranking":          result.get("ranking", []),
+            "ranking":          result.get("ranking", ""),
             "evolution_trends": result.get("evolution_trends", ""),
             "positioning":      result.get("positioning", ""),
-            "web_papers_used":  state.get("web_papers", []),
+            "web_papers_used":  result.get("web_papers_used", state.get("web_papers", [])),
             "error":            "",
         }
 
     except Exception as e:
+        notify_groq_complete()
         logger.warning(f"[COMPARISON] failed attempt {state['retry_count']+1}: {e}")
         return {
             **state,
@@ -339,17 +451,14 @@ def _should_retry(state: ComparisonState) -> str:
 # ── Graph ─────────────────────────────────────────────────────────────────────
 def _build_graph():
     graph = StateGraph(ComparisonState)
-
     graph.add_node("fetch_web", _fetch_web_papers_node)
     graph.add_node("compare",   _compare_node)
-
     graph.set_entry_point("fetch_web")
     graph.add_edge("fetch_web", "compare")
     graph.add_conditional_edges("compare", _should_retry, {
         "compare": "compare",
         END:       END,
     })
-
     return graph.compile()
 
 
@@ -368,6 +477,10 @@ class ComparisonAgent:
         paper_analyses: List[Any],
         use_web:        bool = False,
     ) -> Dict[str, Any]:
+        """
+        _compare_node is self-throttling (sync_wait_for_groq + notify_groq_complete).
+        The orchestrator must NOT call notify_groq_complete() after this.
+        """
         import asyncio
         loop = asyncio.get_running_loop()
 
@@ -378,7 +491,7 @@ class ComparisonAgent:
             "use_web":          use_web,
             "web_papers":       [],
             "comparison_table": {},
-            "ranking":          [],
+            "ranking":          "",
             "evolution_trends": "",
             "positioning":      "",
             "web_papers_used":  [],
@@ -392,8 +505,8 @@ class ComparisonAgent:
 
         return {
             "comparison_table": result.get("comparison_table", {}),
-            "ranking":          result.get("ranking", []),
+            "ranking":          result.get("ranking",          ""),
             "evolution_trends": result.get("evolution_trends", ""),
-            "positioning":      result.get("positioning", ""),
-            "web_papers_used":  result.get("web_papers_used", []),
+            "positioning":      result.get("positioning",      ""),
+            "web_papers_used":  result.get("web_papers_used",  []),
         }
