@@ -2,25 +2,6 @@
 comparison_agent.py — LangGraph-based comparison agent
 1 paper  → web-augmented comparison (arXiv + Tavily)
 2+ papers → direct paper vs paper comparison
-
-── QUALITY DESIGN ────────────────────────────────────────────────────────────
-Three problems caused poor comparison table quality:
-
-1. Uploaded paper row showed Score=N/A, Year=N/A:
-   The prompt only received summary[:1000] and entity lists. If the summary
-   didn't explicitly say "41.0 BLEU" and the year wasn't in those fields,
-   the LLM had no data to fill those cells and correctly wrote N/A.
-   Fix: explicitly pass year, key_results, and a longer summary (1500 chars).
-   key_results is built from the refined_summary by extracting numeric patterns.
-
-2. Retrieved papers were irrelevant (5 dropout papers for a Transformer paper):
-   Caused by arXiv query containing "dropout" — fixed in arxiv_service.py.
-   But as a second layer of defence, the prompt now instructs the LLM to skip
-   rows for papers that are clearly from a different research area.
-
-3. Tavily query had duplicate terms ("BERT BERT Transformer"):
-   Already fixed — title_words deduplication is preserved here.
-─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
@@ -70,44 +51,137 @@ def _clean_title(filename: str) -> str:
     return name or "Uploaded Paper"
 
 
-def _extract_key_results(summary: str, metrics: List[str], datasets: List[str]) -> str:
+# Broad patterns that identify benchmark score sentences without needing an entity list.
+# These fire even when extraction finds metrics=[].
+_SCORE_PATTERNS = re.compile(
+    r'\b\d+\.?\d*\s*(?:BLEU|bleu)\b'
+    r'|\bBLEU\s+(?:score\s+)?(?:of\s+)?\d+\.?\d*'
+    r'|\b\d+\.?\d*\s*(?:top-1|top-5|mAP|IoU|WER|CER|ROUGE|BERTScore|perplexity)\b'
+    r'|\bscore\s+of\s+\d+\.?\d*'
+    r'|\b\d+\.?\d*\s*(?:%|percent)\s+(?:accuracy|precision|recall|F1)'
+    r'|\bF1\s+(?:score\s+)?(?:of\s+)?\d+\.?\d*'
+    r'|\baccuracy\s+(?:of\s+)?\d+\.?\d*',
+    re.IGNORECASE,
+)
+
+
+def _extract_key_results(
+    summary:  str,
+    metrics:  List[str],
+    datasets: List[str],
+    triples:  Optional[List[Dict]] = None,
+) -> str:
     """
-    Pull numeric result sentences from the summary to give the LLM explicit
-    score data for filling the Score column.
+    Extract key numeric results from multiple sources, in priority order.
 
-    Strategy: find sentences that contain both a number and a metric/dataset name.
-    Returns a concise string like "41.0 BLEU on WMT 2014 EN-FR; 28.4 BLEU on EN-DE"
+    Layer 1 — Broad pattern scan (no entity list needed):
+      Finds sentences containing known benchmark score patterns: BLEU, F1, accuracy,
+      top-1, etc. Works even when metrics=[] from extraction.
+
+    Layer 2 — Entity-aware scan (existing logic):
+      Finds sentences containing both a number AND a known metric/dataset keyword.
+      Supplements Layer 1 when entity lists are populated.
+
+    Layer 3 — ACHIEVES triples fallback:
+      When Layers 1+2 find nothing, mines ACHIEVES triples from the knowledge graph.
+      These were independently extracted from the paper text and contain
+      model→result relationships even when the summary doesn't have clean sentences.
+
+    Returns a pipe-separated string of up to 4 result statements, or "" if none found.
     """
-    if not summary:
-        return ""
+    result_sentences: List[str] = []
+    seen_lower: set = set()
 
-    # Build a set of known metric/dataset keywords for matching
-    known_terms = set()
-    for m in metrics[:5]:
-        known_terms.update(m.lower().split())
-    for d in datasets[:5]:
-        known_terms.update(d.lower().split())
-    # remove stopwords from the match set
-    _sw = {"on", "the", "a", "an", "of", "for", "in", "with", "and", "or", "to"}
-    known_terms -= _sw
+    def _add(s: str) -> None:
+        s = s.strip()
+        key = s.lower()[:80]
+        if s and key not in seen_lower and len(result_sentences) < 4:
+            seen_lower.add(key)
+            result_sentences.append(s)
 
-    # Split summary into sentences
-    sentences = re.split(r'(?<=[.!?])\s+', summary.strip())
+    if summary:
+        sentences = re.split(r'(?<=[.!?])\s+', summary.strip())
 
-    # A sentence is a "result sentence" if it has a number AND a known term
-    result_sentences = []
-    for sent in sentences:
-        has_number = bool(re.search(r'\b\d+\.?\d*\b', sent))
-        sent_lower = sent.lower()
-        has_metric = any(kw in sent_lower for kw in known_terms if len(kw) >= 3)
-        if has_number and has_metric and len(sent) < 300:
-            result_sentences.append(sent.strip())
+        # Layer 1: broad score pattern scan
+        for sent in sentences:
+            if _SCORE_PATTERNS.search(sent) and len(sent) < 300:
+                _add(sent)
+
+        # Layer 2: entity-aware scan
+        known_terms: set = set()
+        for m in metrics[:5]:
+            known_terms.update(m.lower().split())
+        for d in datasets[:5]:
+            known_terms.update(d.lower().split())
+        _sw = {"on", "the", "a", "an", "of", "for", "in", "with", "and", "or", "to"}
+        known_terms -= _sw
+
+        if known_terms:
+            for sent in sentences:
+                has_number = bool(re.search(r'\b\d+\.?\d*\b', sent))
+                has_term   = any(kw in sent.lower() for kw in known_terms if len(kw) >= 3)
+                if has_number and has_term and len(sent) < 300:
+                    _add(sent)
+
+    # Layer 3: ACHIEVES triples fallback (fires when Layers 1+2 find nothing)
+    if not result_sentences and triples:
+        achieves = [t for t in triples if t.get("relation") == "ACHIEVES"]
+        for t in achieves[:4]:
+            subj = t.get("subject", "")
+            obj  = t.get("object", "")
+            if subj and obj:
+                _add(f"{subj} achieves {obj}")
 
     if not result_sentences:
         return ""
 
-    # Return up to 4 result sentences, joined with semicolons for compact display
-    return " | ".join(result_sentences[:4])
+    return " | ".join(result_sentences)
+
+
+def _extract_year(entities: Dict, summary: str) -> str:
+    """
+    Extract the paper's publication year from entities or summary text.
+
+    Stage 1: entities["year"] if non-empty and looks like a valid year.
+    Stage 2: regex scan of summary for citation-context year patterns.
+             Explicitly avoids false positives from dataset year tokens
+             like "WMT 2014" or "ImageNet 2012".
+
+    Returns the year as a string, or "N/A" if not found.
+    """
+    # Stage 1: trust extraction when it populated the year field
+    year_from_entities = str(entities.get("year", "") or "").strip()
+    if re.match(r'^(?:19|20)\d{2}$', year_from_entities):
+        return year_from_entities
+
+    if not summary:
+        return "N/A"
+
+    # Build dataset-year exclusion set to avoid "WMT 2014" → "2014" false positives
+    dataset_years: set = set()
+    for d in entities.get("datasets", []):
+        m = re.search(r'\b(?:19|20)\d{2}\b', d)
+        if m:
+            dataset_years.add(m.group())
+
+    # Citation-context patterns ordered by specificity
+    citation_patterns = [
+        r'\((?:[^)]*?)(\b(?:19|20)\d{2}\b)(?:[^)]*?)\)',    # (Vaswani et al., 2017)
+        r'et\s+al[.,][,\s]+(\b(?:19|20)\d{2}\b)',            # et al., 2017
+        r'et\s+al[.,]\s+(\b(?:19|20)\d{2}\b)',               # et al. 2017
+        r'published\s+(?:in\s+)?(\b(?:19|20)\d{2}\b)',       # published in 2017
+        r'introduced\s+in\s+(\b(?:19|20)\d{2}\b)',           # introduced in 2017
+        r'proposed\s+(?:in\s+)?(\b(?:19|20)\d{2}\b)',        # proposed in 2017
+        r'(?:^|[,.\s])in\s+(\b(?:20\d{2}|19[89]\d)\b)(?:[,.\s]|$)',  # "in 2017,"
+    ]
+
+    for pattern in citation_patterns:
+        for m in re.finditer(pattern, summary, re.IGNORECASE):
+            year = m.group(1)
+            if year not in dataset_years:
+                return year
+
+    return "N/A"
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -137,42 +211,43 @@ RELATED PAPERS (retrieved from arXiv / web)
 ANALYSIS INSTRUCTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 comparison_table:
-  • One row per paper: uploaded paper FIRST, then only RELEVANT related papers.
-  • RELEVANCE FILTER: skip any retrieved paper that is clearly from a different
-    research area than the uploaded paper. For example, if the uploaded paper is
-    about Transformer architecture for machine translation, skip papers that are
-    purely about dropout regularization, image segmentation, or reinforcement
-    learning — they are not meaningful comparisons.
+  • One row per paper: uploaded paper FIRST, then ALL retrieved related papers.
+  • INCLUSION RULE: include all retrieved papers that are in the same broad
+    research area as the uploaded paper — even if they are not directly
+    on the same benchmark. Only exclude papers that are completely unrelated
+    (e.g. a medical imaging paper when the uploaded paper is about NLP).
+    Papers in adjacent areas (e.g. LSTM variants when the uploaded paper is
+    about Transformers) should be included, not skipped.
   • Paper column: exact paper title.
-  • Model: primary model or algorithm name. "N/A" if not stated in the provided text.
+  • Model: primary model or algorithm name. "N/A" if not stated.
   • Dataset: primary evaluation dataset. "N/A" if not stated.
   • Key Metric: metric name that best characterises the paper's main result.
   • Score: EXACT numeric value from the provided text.
     For the uploaded paper: look in Key Results above first, then the Summary.
-    For retrieved papers: look in their abstracts below.
+    For retrieved papers: look in their abstracts.
     Use "N/A" ONLY if no numeric score appears anywhere in the provided text.
     Do NOT estimate, round, or invent values.
   • Year: for the uploaded paper use Year={year}. For retrieved papers use
-    their publication year. "N/A" only if genuinely unknown.
-  • PHANTOM ROW RULE: only create rows for named research papers. No rows
-    for datasets, metrics, or benchmark names.
+    their publication year from the abstracts. "N/A" only if genuinely unknown.
+  • PHANTOM ROW RULE: only create rows for named research papers.
 
 ranking:
-  • Include only papers that appear in the comparison_table.
-  • If papers share the same metric → rank by score descending.
+  • Include only papers in the comparison_table.
+  • If papers share the same primary metric → rank by score descending.
   • If metrics differ → rank by recency (newest first).
   • Prefix: "Ranked by <criterion>: 1. Paper, 2. Paper, ..."
 
 evolution_trends:
   • 2–3 sentences on the methodological progression these papers represent.
-  • Cite specific paper titles and years.
+  • Cite specific paper titles and years from the provided text.
 
 positioning:
-  • 2–3 sentences. Where does the uploaded paper sit relative to the relevant
-    retrieved works — ahead, behind, orthogonal, or complementary? WHY specifically?
+  • 2–3 sentences. Where does the uploaded paper sit relative to the retrieved
+    works — ahead, behind, orthogonal, or complementary? State the specific
+    technical reason.
 
 web_papers_used:
-  • Only papers that appear as rows in comparison_table.
+  • All papers that appear as rows in comparison_table (except the uploaded paper).
   • Format: {{"title": "paper title", "url": "url or N/A"}}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -183,11 +258,11 @@ OUTPUT — JSON ONLY
     "headers": ["Paper", "Model", "Dataset", "Key Metric", "Score", "Year"],
     "rows": [
       ["{title}", "primary_model", "primary_dataset", "primary_metric", "score_from_key_results", "{year}"],
-      ["Relevant Related Paper", "...", "...", "...", "...", "..."]
+      ["Related Paper Title", "...", "...", "...", "...", "..."]
     ]
   }},
   "ranking": "Ranked by <criterion>: 1. Paper A, 2. Paper B, ...",
-  "evolution_trends": "2-3 sentence trend analysis citing specific papers.",
+  "evolution_trends": "2-3 sentence trend analysis citing specific papers and years.",
   "positioning": "2-3 sentence positioning with specific technical reason.",
   "web_papers_used": [
     {{"title": "paper title", "url": "url or N/A"}}
@@ -215,8 +290,7 @@ comparison_table:
   • Dataset: primary evaluation dataset. "N/A" if absent.
   • Key Metric: metric that best characterises the paper's main claim.
   • Score: EXACT numeric value from the summary. "N/A" only if not present.
-  • Key Innovation: one clause describing the specific technical mechanism
-    (e.g. "scaled dot-product self-attention without recurrence").
+  • Key Innovation: one clause describing the specific technical mechanism.
     Not the topic — the mechanism. "N/A" if not determinable.
   • HALLUCINATION RULE: if a value is not in the provided summaries, write "N/A".
 
@@ -292,7 +366,6 @@ def _fetch_web_papers_node(state: ComparisonState) -> ComparisonState:
     try:
         from src.research_intelligence_system.tools.web_search import sync_web_search
 
-        # Deduplicate: skip model names already in the title
         title_words   = set(title.lower().split())
         unique_models = [
             m for m in entities.get("models", [])[:2]
@@ -325,33 +398,41 @@ def _compare_node(state: ComparisonState) -> ComparisonState:
                 "retry_count": state["retry_count"] + 1}
 
     if state["use_web"]:
-        paper    = analyses[0]
-        entities = paper.entities or {}
-        title    = _clean_title(paper.filename or "")
-
-        # ── Extract year ──────────────────────────────────────────────────────
-        year = str(entities.get("year", "") or "").strip() or "N/A"
-
-        # ── Extract key numeric results from the refined summary ──────────────
+        paper           = analyses[0]
+        entities        = paper.entities or {}
+        title           = _clean_title(paper.filename or "")
         refined_summary = paper.refined_summary or ""
+
+        # Pull paper triples for the ACHIEVES fallback in _extract_key_results
+        triples = list(getattr(paper, "triples", None) or [])
+
+        # Year: entities["year"] → then regex scan summary
+        year = _extract_year(entities, refined_summary)
+
+        # Key results: three-layer extraction
         key_results = _extract_key_results(
             summary  = refined_summary,
             metrics  = entities.get("metrics",  []),
             datasets = entities.get("datasets", []),
+            triples  = triples,
         )
-        if not key_results:
-            key_results = "See summary above — extract numeric scores from Key Metric + Dataset mentions."
 
-        # ── Build web papers text ─────────────────────────────────────────────
+        if not key_results:
+            key_results = (
+                "Numeric scores not found in summary. "
+                "Look for benchmark results in the Summary field above."
+            )
+
         web_text = "\n".join([
-            f"- {p.get('title', 'Unknown')} ({p.get('year', 'N/A')}): {p.get('abstract', '')[:300]}"
+            f"- {p.get('title', 'Unknown')} ({p.get('year', 'N/A')}): "
+            f"{p.get('abstract', '')[:300]}"
             for p in state.get("web_papers", [])
         ]) or "No related papers retrieved."
 
         prompt = _WEB_COMPARISON_PROMPT.format(
             title       = title,
             year        = year,
-            summary     = refined_summary[:1500],   # ↑ was 1000
+            summary     = refined_summary[:1500],
             key_results = key_results,
             models      = ", ".join(entities.get("models",   [])[:8]),
             datasets    = ", ".join(entities.get("datasets", [])[:8]),
@@ -363,19 +444,22 @@ def _compare_node(state: ComparisonState) -> ComparisonState:
     else:
         papers_text = ""
         for i, paper in enumerate(analyses, 1):
-            entities = paper.entities or {}
-            title    = _clean_title(paper.filename or f"Paper {i}")
-            year     = str(entities.get("year", "") or "").strip() or "N/A"
+            entities        = paper.entities or {}
+            title           = _clean_title(paper.filename or f"Paper {i}")
+            refined_summary = paper.refined_summary or ""
+            triples         = list(getattr(paper, "triples", None) or [])
 
+            year        = _extract_year(entities, refined_summary)
             key_results = _extract_key_results(
-                summary  = paper.refined_summary or "",
+                summary  = refined_summary,
                 metrics  = entities.get("metrics",  []),
                 datasets = entities.get("datasets", []),
+                triples  = triples,
             )
 
             papers_text += (
                 f"\nPaper {i}: {title} ({year})\n"
-                f"Summary:     {(paper.refined_summary or '')[:600]}\n"
+                f"Summary:     {refined_summary[:600]}\n"
                 f"Key Results: {key_results or 'not explicitly stated'}\n"
                 f"Models:      {', '.join(entities.get('models',   [])[:5])}\n"
                 f"Datasets:    {', '.join(entities.get('datasets', [])[:5])}\n"
@@ -396,13 +480,10 @@ def _compare_node(state: ComparisonState) -> ComparisonState:
         notify_groq_complete()
 
         raw = response.content.strip()
-
-        # Strip markdown fences
         raw = re.sub(r'```(?:json)?\s*', '', raw)
         raw = re.sub(r'```\s*$', '', raw, flags=re.MULTILINE)
         raw = raw.strip()
 
-        # Try direct parse first
         result = None
         try:
             result = json.loads(raw)
@@ -479,7 +560,7 @@ class ComparisonAgent:
     ) -> Dict[str, Any]:
         """
         _compare_node is self-throttling (sync_wait_for_groq + notify_groq_complete).
-        The orchestrator must NOT call notify_groq_complete() after this.
+        The orchestrator must NOT call notify_groq_complete() after this method.
         """
         import asyncio
         loop = asyncio.get_running_loop()
