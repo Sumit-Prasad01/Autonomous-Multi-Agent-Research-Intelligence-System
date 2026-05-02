@@ -7,7 +7,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.research_intelligence_system.database.models import (
-    KnowledgeTriple, LiteratureReview, PaperAnalysis, PaperComparison
+    KnowledgeTriple, LiteratureReview, PaperAnalysis, PaperComparison, GraphSnapshot
 )
 from src.research_intelligence_system.utils.logger import get_logger
 
@@ -239,4 +239,78 @@ async def save_hallucination(
         hallucination_score     = hallucination_score,
         faithfulness_score      = faithfulness_score,
         hallucinated_sentences  = hallucinated_sentences,
+    )
+
+# ── GraphSnapshot ──────────────────────────────────────────────────────────────
+ 
+async def save_snapshot(
+    db:             AsyncSession,
+    chat_id:        str,
+    paper_id:       str,
+    paper_year:     int,
+    snapshot_order: int,
+    node_count:     int,
+    edge_count:     int,
+    gap_count:      int,
+    gaps_closed:    int,
+    gaps_opened:    int,
+    closure_rate:   float,
+    velocity:       float,
+    node_delta:     int,
+    edge_delta:     int,
+    snapshot_data:  dict,
+) -> "GraphSnapshot":
+    """
+    Save a graph evolution snapshot to the database.
+    Called by GraphEvolutionTracker.snapshot() after each paper is processed.
+    """
+    snap = GraphSnapshot(
+        chat_id        = uuid.UUID(chat_id),
+        paper_id       = uuid.UUID(paper_id),
+        paper_year     = paper_year,
+        snapshot_order = snapshot_order,
+        node_count     = node_count,
+        edge_count     = edge_count,
+        node_delta     = node_delta,
+        edge_delta     = edge_delta,
+        gap_count      = gap_count,
+        gaps_closed    = gaps_closed,
+        gaps_opened    = gaps_opened,
+        closure_rate   = closure_rate,
+        velocity       = velocity,
+        snapshot_data  = snapshot_data,
+    )
+    db.add(snap)
+    await db.commit()
+    await db.refresh(snap)
+    return snap
+ 
+ 
+async def get_snapshots(
+    db:      AsyncSession,
+    chat_id: str,
+) -> List["GraphSnapshot"]:
+    """
+    Return all snapshots for a chat, ordered by snapshot_order ascending.
+    Used by GraphEvolutionTracker to compute deltas and by the API endpoint.
+    """
+    result = await db.execute(
+        select(GraphSnapshot)
+        .where(GraphSnapshot.chat_id == uuid.UUID(chat_id))
+        .order_by(GraphSnapshot.snapshot_order.asc())
+    )
+    return list(result.scalars().all())
+ 
+ 
+async def get_latest_snapshot(
+    db:      AsyncSession,
+    chat_id: str,
+) -> Optional["GraphSnapshot"]:
+    """
+    Return the most recent snapshot for a chat.
+    """
+    return await db.scalar(
+        select(GraphSnapshot)
+        .where(GraphSnapshot.chat_id == uuid.UUID(chat_id))
+        .order_by(GraphSnapshot.snapshot_order.desc())
     )

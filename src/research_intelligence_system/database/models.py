@@ -215,3 +215,64 @@ class LiteratureReview(Base):
     __table_args__ = (
         Index("ix_litreview_chat", "chat_id"),
     )
+
+class GraphSnapshot(Base):
+    """
+    Records the state of the knowledge graph after each paper is processed.
+    Forms a time series that tracks research field evolution over time.
+ 
+    This is the database backing for Contribution 2:
+    "Knowledge Graph Evolution as a Measurable Property of Research Fields"
+ 
+    One row is created per paper per chat, immediately after gap detection
+    completes in the orchestrator pipeline.
+ 
+    Key metrics:
+      closure_rate: fraction of previous gaps resolved by this paper
+      velocity:     change in closure_rate vs previous snapshot
+                    positive = field accelerating gap resolution
+                    negative = field slowing down
+      node_delta:   new entity nodes added by this paper
+      edge_delta:   new relationship edges added by this paper
+    """
+    __tablename__ = "graph_snapshots"
+ 
+    id             = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    chat_id        = Column(UUID(as_uuid=True), ForeignKey("chats.id", ondelete="CASCADE"),
+                            nullable=False, index=True)
+    paper_id       = Column(UUID(as_uuid=True), ForeignKey("paper_analyses.id",
+                            ondelete="CASCADE"), nullable=False)
+ 
+    # Ordering — snapshot_order is 1-indexed within the chat
+    # paper_year is the publication year for chronological experiments
+    snapshot_order = Column(Integer, nullable=False, default=1)
+    paper_year     = Column(Integer, nullable=True, default=0)
+ 
+    # Graph state at this snapshot
+    node_count     = Column(Integer, default=0)   # entity nodes (excl. Paper nodes)
+    edge_count     = Column(Integer, default=0)   # relationship edges between entities
+    node_delta     = Column(Integer, default=0)   # nodes added since previous snapshot
+    edge_delta     = Column(Integer, default=0)   # edges added since previous snapshot
+ 
+    # Gap dynamics (Definition 4, 5, 6 from paper)
+    gap_count      = Column(Integer, default=0)   # open gaps at this snapshot
+    gaps_closed    = Column(Integer, default=0)   # gaps from prev snapshot now resolved
+    gaps_opened    = Column(Integer, default=0)   # new gaps not in prev snapshot
+ 
+    # Derived metrics (Definition 5)
+    closure_rate   = Column(Float, default=0.0)   # gaps_closed / prev_gap_count
+    velocity       = Column(Float, default=0.0)   # closure_rate - prev_closure_rate
+ 
+    # Rich detail for analysis (gap texts, node lists)
+    snapshot_data  = Column(JSON, default=dict)
+    # {
+    #   "gap_keys":    [str, ...],       ← for delta computation in next snapshot
+    #   "gaps_detail": [{key, text, novelty}, ...]
+    # }
+ 
+    created_at     = Column(DateTime(timezone=True), server_default=func.now())
+ 
+    __table_args__ = (
+        Index("ix_snapshot_chat_order", "chat_id", "snapshot_order"),
+        Index("ix_snapshot_paper",      "paper_id"),
+    )
