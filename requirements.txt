@@ -44,3 +44,7 @@ python-multipart
 neo4j
 arxiv
 pyvis
+sseclient
+pydantic[email]
+bcrypt==4.0.1
+aiofiles
